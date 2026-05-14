@@ -498,14 +498,18 @@ class QwenTTSBackendV2:
         self._speech_tokenizer = model.speech_tokenizer
 
         # torch.compile for kernel fusion — set V2_COMPILE=0 to disable
+        # torch.compile with mode="default" — applies kernel fusion without CUDA graphs.
+        # "reduce-overhead" enables CUDA graphs which require static tensor shapes,
+        # but our KV cache grows each decode step (dynamic seq_len) which causes
+        # "tensor output overwritten by subsequent run" errors. "default" is safe.
         if os.environ.get("V2_COMPILE", "1") != "0":
-            logger.info("[v2] Applying torch.compile (set V2_COMPILE=0 to skip)...")
+            logger.info("[v2] Applying torch.compile mode=default (set V2_COMPILE=0 to skip)...")
             try:
                 model.talker.model = torch.compile(
-                    model.talker.model, mode="reduce-overhead", fullgraph=False
+                    model.talker.model, mode="default", fullgraph=False
                 )
                 model.talker.code_predictor.model = torch.compile(
-                    model.talker.code_predictor.model, mode="reduce-overhead", fullgraph=False
+                    model.talker.code_predictor.model, mode="default", fullgraph=False
                 )
                 logger.info("[v2] torch.compile applied")
             except Exception as e:
