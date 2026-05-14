@@ -1,45 +1,25 @@
 # Qwen3-TTS + Megakernel + Pipecat
 
-Real-time voice agent: mic → STT → LLM → Qwen3-TTS → speaker, targeting RTX 5090 (Blackwell).
+Real-time voice agent on RTX 5090: mic → STT → LLM → Qwen3-TTS → speaker.
 
 ```
-Mic → [Deepgram STT] → [gpt-5-mini LLM] → [Custom TTS decode loop] → [Vocoder] → Speaker
+Mic → [Deepgram STT] → [gpt-5-mini] → [Custom TTS decode loop] → [Vocoder] → Speaker
 ```
 
 ---
 
 ## Performance Numbers
 
-Measured on RTX 5090 (Blackwell, sm_120a), CUDA 12.8, bfloat16, no flash-attn.
-All numbers from `scripts/test_v2_decode.py` after CUDA graph warmup.
+Measured on RTX 5090 (Blackwell, sm_120a), CUDA 12.8, bfloat16.
+All numbers after CUDA graph warmup. Text: "Hello, this is a test."
 
-### Current best (custom decode loop + CUDA graphs, `tts_backend_v2`)
-
-| Metric | Value | Target | Gap |
-|--------|-------|--------|-----|
-| RTF | **0.237** | < 0.15 | 1.58× |
-| TTFC | **93 ms** | < 60 ms | 1.55× |
-| Codec frames/s | **76.6** | — | — |
-| ms/frame (decode only) | **13.1 ms** | < 12 ms | close |
-
-### Progress across sessions
-
-| Session | Approach | RTF | TTFC | Notes |
-|---------|----------|-----|------|-------|
-| 1-4 | HF baseline | 1.070 | 6338 ms | Vanilla HF, no streaming |
-| 5-6 | Megakernel monkey-patch | ~1.07 | ~6338 ms | Megakernel ran but EOS never fired; fell back to HF every call |
-| Phase 2 (v2) eager | Custom decode loop | 0.835 | 842 ms | EOS fires, real streaming, no CUDA graphs |
-| Phase 2 + CUDA graphs | StaticCache + graph capture | **0.237** | **93 ms** | Current state |
-
-### HuggingFace baseline (no custom loop)
-
-| Text | TTFC | RTF |
-|------|------|-----|
-| "Hello." | 4762 ± 2538 ms | 1.126 ± 0.015 |
-| "The quick brown fox..." | 4641 ± 509 ms | 1.119 ± 0.009 |
-| "Artificial intelligence is transforming..." | 6704 ± 496 ms | 1.006 ± 0.007 |
-| "In the beginning there was darkness..." | 9243 ± 618 ms | 1.031 ± 0.023 |
-| **Mean** | **6338 ms** | **1.070** |
+| Metric | HF Baseline | v2 (Custom loop + CUDA graphs) | Target | Gap |
+|--------|-------------|-------------------------------|--------|-----|
+| RTF | 1.070 | **0.209** | < 0.15 | 1.4× |
+| TTFC | 6338 ms | **135 ms** | < 60 ms | 2.25× |
+| Codec frames/s | ~12 | **77** | — | 6.4× faster |
+| Streaming | Buffered (fake) | **Real** (per-frame) | Real | ✅ |
+| EOS | Never fired | **Fires correctly** | — | ✅ |
 
 ---
 
@@ -48,46 +28,44 @@ All numbers from `scripts/test_v2_decode.py` after CUDA graph warmup.
 ### Pipeline
 
 ```
-mic → Deepgram STT → gpt-5-mini LLM → QwenTTSService → QwenTTSBackendV2 → speaker
+Mic → Deepgram STT → gpt-5-mini LLM → QwenTTSService → QwenTTSBackendV2 → Speaker
                                               ↓
-                               Custom decode loop (tts_backend_v2.py)
-                               ├── HF prefill (DynamicCache, variable length)
-                               ├── PredictorGraph CUDA graph (15-step predictor loop)
-                               ├── TalkerGraph CUDA graph (28-layer decode step)
-                               └── Incremental vocoder (25-frame context window)
+                          ┌───────────────────────────────────┐
+                          │  Custom decode loop (v2)          │
+                          │                                   │
+                          │  HF prefill (eager, DynamicCache) │
+                          │       ↓                           │
+                          │  PredictorGraph (CUDA graph)      │
+                          │  15-step codebook loop ~2ms       │
+                          │       ↓                           │
+                          │  TalkerGraph (CUDA graph)         │
+                          │  28-layer decode step ~3ms        │
+                          │       ↓                           │
+                          │  Incremental vocoder              │
+                          │  (async thread, 25-frame context) │
+                          └───────────────────────────────────┘
 ```
 
-### Custom decode loop (Phase 2 architecture)
+### Why the custom decode loop (not HF generate)
 
-The core insight from inspecting `modeling_qwen3_tts.py` and `andimarafioti/faster-qwen3-tts`: Qwen3-TTS generation is **not** simple autoregressive token sampling. Each decode step requires:
+Qwen3-TTS generation is not simple autoregressive token sampling. Each decode step requires:
 
-1. **Prefill** — HF talker processes text+speaker embeddings → `DynamicCache` + `past_hidden` + first logits
-2. **Per-step loop:**
-   - Sample CB0 token from logits
-   - `pred_input = cat(past_hidden, codec_embedding(CB0))`  `[1, 2, 1024]`
-   - Run code predictor 15 steps → CB1..CB15  → full codec frame `[16]`
-   - Build next-step embedding: sum of 16 per-codebook embeddings + text conditioning
-   - Run talker backbone → new `hidden`, `past_hidden`, logits
-3. **Incremental vocoder** — every 4 codec frames, decode with 25-frame left-context window → yield audio
+1. **Code predictor** — 15 autoregressive steps producing 16 codebook tokens per frame
+2. **Embedding reconstruction** — sum of 16 per-codebook embeddings as next-step input
+3. **Text conditioning** — `trailing_text_hiddens[:, gen_step]` added per step
 
-Previous approach (monkey-patching `talker.generate()`) failed because it only tracked integer token IDs and ignored the code predictor entirely — causing EOS never to fire and sequence divergence from step 1.
+The Phase 1 approach (monkey-patching `talker.generate()`) skipped all of this, so EOS never fired and the sequence diverged from step 1. The v2 loop owns the full runtime.
 
-### CUDA graphs (key speedup)
+### CUDA graphs
 
-Both hot paths captured as CUDA graphs using `transformers.StaticCache`:
+Both hot paths captured using `transformers.StaticCache`:
 
-| Component | Eager | CUDA graph | Speedup |
-|-----------|-------|------------|---------|
-| Code predictor (15 steps) | ~49 ms | ~2-3 ms | ~20× |
-| Talker backbone (1 step, 28L) | ~20 ms | ~2-5 ms | ~5× |
+| Component | Eager | Graph | Why graphs work |
+|-----------|-------|-------|-----------------|
+| Predictor (15 steps) | ~49 ms | ~2 ms | Fixed 17-token sequence, static shapes |
+| Talker (28L, 1 step) | ~20 ms | ~3 ms | StaticCache pre-allocated, `index_copy_()` |
 
-**Why StaticCache:** `DynamicCache` grows via `torch.cat` every step → dynamo recompiles on each new shape. `StaticCache` pre-allocates `[batch, kv_heads, max_seq, head_dim]` and writes via `index_copy_()` → shape never changes → CUDA graph capture works.
-
-**Prefill flow:** HF eager prefill (variable prompt length) → `prefill_kv()` copies `DynamicCache` → `StaticCache` → CUDA graph decode loop with static shapes.
-
-### Streaming
-
-Audio chunks arrive every 4 codec frames = 320ms of audio. The vocoder runs inside the decode thread with a 25-frame causal context window. First chunk TTFC = prefill + 4 decode steps + one vocoder call ≈ 21ms + 4×13ms + 5ms = **~78ms**.
+`DynamicCache` grows via `torch.cat` every step → dynamo recompiles → falls back to eager. `StaticCache` writes at a fixed index → shapes never change → CUDA graphs work.
 
 ---
 
@@ -96,71 +74,100 @@ Audio chunks arrive every 4 codec frames = 320ms of audio. The vocoder runs insi
 - GPU: RTX 5090 (Blackwell, sm_120a), CUDA 12.8+, driver 570+
 - GPU RAM: ~8 GB (Qwen3-TTS 0.6B in bfloat16)
 - Recommended: Vast.ai RTX 5090 instance
-- API keys: OpenAI + Deepgram
+- API keys: OpenAI (`OPENAI_API_KEY`) + Deepgram (`DEEPGRAM_API_KEY`)
 
 ---
 
-## GPU Server Setup
+## Setup (GPU Server)
 
-### 1. Clone
+### 1. Provision a Vast.ai RTX 5090 instance
+
+- Template: PyTorch 2.x + CUDA 12.8
+- Disk: 40GB+ (model download ~8GB, PyTorch ~4GB)
+- Open port 8000 in the instance settings
+
+### 2. Clone and run setup
 
 ```bash
 git clone <your-repo-url> /workspace/qwen-megakernel-pipecat
 cd /workspace/qwen-megakernel-pipecat
-```
-
-### 2. One-shot setup
-
-```bash
 bash scripts/setup_server.sh
 ```
 
-Installs deps, creates `.venv`, installs PyTorch cu128, clones and builds the megakernel extension. Takes ~10 minutes first run.
+Setup takes ~10 minutes (PyTorch download is ~820MB). It:
+- Installs system deps (libsndfile1, ffmpeg, git)
+- Creates `.venv` with PyTorch cu128
+- Installs all Python packages
+- Clones and builds the megakernel (for Phase 1 compatibility)
+- Validates v2 backend imports
 
-### 3. Set env vars
+### 3. Configure environment
 
 ```bash
 cp .env.example .env
-# Fill in: OPENAI_API_KEY, DEEPGRAM_API_KEY
+nano .env
 ```
 
-### 4. Start the server
+Fill in:
+```
+OPENAI_API_KEY=sk-...
+DEEPGRAM_API_KEY=dg-...
+ALLOWED_ORIGIN=*
+```
+
+### 4. Validate the decode pipeline
+
+Before starting the server, run the 5-stage test to confirm everything works:
+
+```bash
+source .venv/bin/activate
+python scripts/test_v2_decode.py
+```
+
+Takes ~2 minutes (includes CUDA graph warmup). You should see:
+```
+STAGE 1 PASS  (prefill: ~50ms)
+STAGE 2 PASS  (3 codec frames produced)
+STAGE 3 PASS  (EOS fired at step ~40, ~77 frames/s)
+STAGE 4 PASS  (WAV saved to /tmp/test_v2_output.wav)
+STAGE 5       (TTFC ~135ms, RTF ~0.21)
+```
+
+### 5. Start the server
 
 ```bash
 source .venv/bin/activate
 set -a && source .env && set +a
-
-# v2 backend (custom decode loop + CUDA graphs) — recommended
 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
-
-# HF baseline (no custom loop)
-TTS_BACKEND=hf uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
 ```
 
-Server exposes:
-- `GET /` — health check
-- `WS /ws` — Pipecat WebSocket endpoint
+**Expected startup time: ~30 seconds** (CUDA graph capture for talker + predictor).
 
-### 5. Validate before running the pipeline
-
-```bash
-python scripts/test_v2_decode.py
+Server is ready when you see:
+```
+[PredictorGraph] CUDA graph captured.
+[TalkerGraph] CUDA graph captured.
+[v2] TalkerGraph + PredictorGraph CUDA graphs active
+[v2] Ready in ~30000ms
+INFO: Application startup complete.
+INFO: Uvicorn running on http://0.0.0.0:8000
 ```
 
-Runs 5 staged tests: prefill capture → single decode step → full decode to EOS → vocoder output → streaming TTFC. Takes ~2 minutes including CUDA graph warmup.
+### 6. Connect the frontend
 
----
-
-## Frontend
-
+**On your local machine** — open SSH tunnel:
 ```bash
-cd client && npm install
-# SSH tunnel from local machine:
-ssh -p <port> root@<ip> -L 8000:localhost:8000
+ssh -p PORT root@VAST_IP -L 8000:localhost:8000 -N
+```
+
+**In a new local terminal:**
+```bash
+cd client
+npm install
 VITE_WS_URL=ws://localhost:8000/ws npm run dev
 ```
 
-Open `http://localhost:5173`, click CONNECT, speak.
+Open `http://localhost:5173`, click **CONNECT**, then speak.
 
 ---
 
@@ -168,10 +175,14 @@ Open `http://localhost:5173`, click CONNECT, speak.
 
 ```bash
 source .venv/bin/activate
-# Full validation + timing breakdown
+
+# Full 5-stage validation + timing breakdown (recommended)
 python scripts/test_v2_decode.py
 
-# HF baseline RTF/TTFC
+# HF baseline for comparison
+V2_CUDA_GRAPHS=0 python scripts/test_v2_decode.py  # disable graphs, see eager numbers
+
+# TTFC / RTF measurement script
 python scripts/benchmark.py --backend hf --trials 5
 ```
 
@@ -183,25 +194,25 @@ python scripts/benchmark.py --backend hf --trials 5
 server/
   pipeline/voice_agent.py               FastAPI + Pipecat pipeline
                                         TTS_BACKEND=v2|hf|megakernel
-  backend/tts_backend_v2.py             Custom decode loop (current)
+  backend/tts_backend_v2.py             Custom decode loop (current — use this)
   backend/cuda_graphs.py                TalkerGraph + PredictorGraph CUDA graph capture
-  backend/tts_backend_mk.py             Megakernel backend (Phase 1, deprecated)
-  backend/tts_backend_hf.py             HF baseline
+  backend/tts_backend_hf.py             Pure HF baseline (slow, for comparison)
+  backend/tts_backend_mk.py             Phase 1 megakernel backend (deprecated)
   pipecat_services/qwen_tts_service.py  Pipecat TTSService adapter
 
 scripts/
-  test_v2_decode.py                     5-stage validation: prefill → EOS → vocoder → TTFC
   setup_server.sh                       One-shot GPU server setup
-  benchmark.py                          TTFC / RTF / tok/s measurement
-  test_mk_decode.py                     Megakernel smoke test (Phase 1)
+  test_v2_decode.py                     5-stage validation: prefill → EOS → vocoder → TTFC
+  benchmark.py                          TTFC / RTF measurement
+  test_mk_decode.py                     Phase 1 megakernel smoke test (historical)
 
 client/
   src/components/Dashboard.tsx          Voice UI with live metrics
   src/lib/pipecatClient.ts              WebSocket transport config
 
 docs/
-  custom_decode_architecture.md         Full decode loop architecture with tensor shapes
-  findings.md                           Ground-truth model inspection results
+  custom_decode_architecture.md         Decode loop architecture with exact tensor shapes
+  findings.md                           Ground-truth model inspection (sessions 1-5)
   progress.md                           Session-by-session progress log
 ```
 
@@ -211,40 +222,45 @@ docs/
 
 ### RTF and TTFC not yet at target
 
-Current: RTF 0.237, TTFC 93ms. Targets: RTF < 0.15, TTFC < 60ms.
+**Current: RTF 0.209, TTFC 135ms. Targets: RTF < 0.15, TTFC < 60ms.**
 
-The remaining gap (1.55×) is split between:
-- Python loop overhead per decode step (~5-8ms/frame)
-- Vocoder running synchronously in the decode thread (~6ms/frame amortized)
-- Audio queue latency for TTFC
+Remaining gap (1.4× on RTF) breaks down as:
+- `token.item()` CPU sync every step (~2ms, unavoidable without megakernel embedding sentinel)
+- `pred_input = cat(past_hidden, last_id_hidden)` small GPU op outside graph
+- Python dispatch overhead per step (~3-5ms total)
 
-### Megakernel not yet integrated into v2
+### What closes the gap: Phase 3 (megakernel in v2 loop)
 
-The `qwen_megakernel` CUDA kernel (`torch.ops.qwen_megakernel_C.decode`) runs at 263 tok/s on RTX 5090 and was verified working in isolation. Phase 3 plan: replace `TalkerGraph`'s decode step with the megakernel, using the sentinel `token_id=-1` trick (3-line patch to `kernel.cu`) to accept pre-computed embeddings instead of integer token IDs. Expected talker latency: ~1ms vs current ~2-5ms.
+The `qwen_megakernel` CUDA kernel (`torch.ops.qwen_megakernel_C.decode`) is built and verified. Integrating it requires a 3-line patch to `kernel.cu`:
 
-### Audio quality not yet validated end-to-end
+```cuda
+// When token_id == -1, read embedding from hidden_buffer instead of embed table
+const __nv_bfloat16 *embed_row =
+    (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
+                          : hidden_buffer;
+```
 
-The v2 pipeline produces audio (confirmed vocoder output, EOS fires correctly, codec frames are valid). Audio quality against the HF baseline has not been formally compared. The Phase 1 megakernel backend produced no audio (EOS never fired).
+This lets us write `inputs_embeds` into `hidden_buffer` before calling `decode(-1)`, eliminating the `token.item()` sync and the Python embedding construction entirely. Talker step would drop from ~3ms to ~1ms, Python overhead ~5ms → ~0ms.
+
+Estimated final numbers with megakernel: **RTF ~0.05, TTFC ~40ms**.
+
+### Audio quality
+
+The v2 pipeline produces audio (confirmed: EOS fires, codec frames are valid, vocoder outputs waveform). Formal quality comparison against HF baseline has not been done.
 
 ### GPU target
 
-Megakernel targets `sm_120a` (RTX 5090 Blackwell) only. The custom decode loop (`tts_backend_v2`) works on any GPU that supports the `qwen_tts` model.
+Megakernel targets `sm_120a` (RTX 5090 Blackwell) only. The v2 custom decode loop runs on any CUDA GPU.
 
 ---
 
-## What Remains for Full Target
+## Kernel Modifications (Phase 1, reference)
 
-1. **Phase 3 — Megakernel in v2 loop** (~1ms/talker step):
-   - 3-line patch to `kernel.cu`: `if (token_id < 0) use hidden_buffer as embedding`
-   - Replace `TalkerGraph.run()` with `mk_decoder.step(-1, embed=inputs_embeds)`
-   - Expected: talker 2-5ms → ~1ms, bringing total below 12ms/frame
+For the `megakernel` backend (not needed for v2):
 
-2. **Python loop vectorization** (~5ms/frame Python overhead):
-   - Move sampling, embedding lookup, tensor cat out of per-step Python loop
-   - Batch 16-codebook embedding sum as a single batched matmul
-
-3. **Async vocoder** — run vocoder in a separate thread, don't block decode loop
-
-4. **flash-attn** — `pip install flash-attn` for 3-4× prefill speedup (TTFC reduction)
-
-5. **Demo recording** — screen capture of full voice round-trip
+| Item | Default | Required | How |
+|------|---------|----------|-----|
+| `LDG_VOCAB_SIZE` | 151936 | **3072** | Patch `csrc/kernel.cu`, rebuild |
+| `MAX_SEQ_LEN` | 2048 | 32768 | Python constant, no rebuild |
+| `rope_theta` | 10000 | 1,000,000 | Python only |
+| RoPE type | (original) | Standard 1D | Python RoPE table, no rebuild |

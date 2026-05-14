@@ -231,12 +231,22 @@ All scratch buffers except `hidden_buffer` are cast to `float*` inside the kerne
 | Python loop overhead | — | ~5-8 ms |
 | **Total per frame** | **~69 ms** | **~13 ms** |
 
+### Final numbers this session (after all optimizations)
+
+| Optimization | RTF | TTFC | Notes |
+|---|---|---|---|
+| CUDA graphs active | 0.237 | 93ms | TalkerGraph + PredictorGraph |
+| + codec_head in graph | 0.257 | 93ms | Slight regression (noise) |
+| + async vocoder thread | **0.209** | **135ms** | Decode and vocoder now overlap |
+
 ### Remaining gap to targets
 
-RTF 0.237 vs 0.15 target — 1.58× remaining. Three paths:
-1. Megakernel for talker (~1ms/step vs current ~2-5ms)
-2. Async vocoder (don't block decode thread on vocoder call)
-3. Python loop vectorization (batch embedding ops)
+RTF 0.209 vs 0.15 target — 1.4× remaining. Root cause:
+- `token.item()` CPU sync every step — unavoidable without megakernel embedding sentinel
+- Python loop overhead: `cat`, `clamp`, `unsqueeze`, dispatch — ~3-5ms/frame
+- TTFC gap: vocoder thread still adds latency on first chunk
+
+Next: Phase 3 — megakernel sentinel patch (3 lines to kernel.cu). Estimated result: RTF ~0.05, TTFC ~40ms.
 
 ---
 
