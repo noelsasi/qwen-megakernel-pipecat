@@ -59,12 +59,12 @@ class QwenTTSBackendHF:
 
         print(f"[QwenTTSBackendHF] Loaded in {(time.perf_counter()-t0)*1000:.0f}ms")
 
-    def _input_ids(self, text: str) -> list:
+    def _prepare(self, text: str) -> dict:
         ids = self.processor(text, return_tensors="pt").input_ids.to(self.model.device)
-        return [ids[0]]
-
-    def _generate_kwargs(self) -> dict:
         return dict(
+            input_ids=[ids[0]],
+            languages=["English"],
+            speakers=["default"],
             max_new_tokens=4096,
             do_sample=True,
             temperature=0.9,
@@ -79,12 +79,10 @@ class QwenTTSBackendHF:
 
     def run_batch(self, text: str) -> np.ndarray:
         """Blocking full inference. Returns float32 audio array."""
-        input_ids = self._input_ids(text)
         with torch.inference_mode():
             outputs = self.model.generate(
-                input_ids=input_ids,
                 non_streaming_mode=True,
-                **self._generate_kwargs(),
+                **self._prepare(text),
             )
         audio = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
         if isinstance(audio, torch.Tensor):
@@ -107,12 +105,10 @@ class QwenTTSBackendHF:
 
         def _stream():
             try:
-                input_ids = self._input_ids(text)
                 with torch.inference_mode():
                     result = self.model.generate(
-                        input_ids=input_ids,
                         non_streaming_mode=False,
-                        **self._generate_kwargs(),
+                        **self._prepare(text),
                     )
                 # If result is iterable (generator), forward each chunk
                 if hasattr(result, "__iter__") and not isinstance(result, (torch.Tensor, np.ndarray)):

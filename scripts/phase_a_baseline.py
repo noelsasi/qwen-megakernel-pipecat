@@ -57,13 +57,19 @@ def run_inference(model, processor, text: str):
       eos_token_id, repetition_penalty
     """
     input_ids = processor(text, return_tensors="pt").input_ids.to(model.device)
+    # languages and speakers must be lists matching len(input_ids) — cannot be None
+    batch_input_ids = [input_ids[0]]
+    languages = ["English"]
+    speakers = ["default"]
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     with torch.inference_mode():
         outputs = model.generate(
-            input_ids=[input_ids[0]],
+            input_ids=batch_input_ids,
+            languages=languages,
+            speakers=speakers,
             non_streaming_mode=True,
             max_new_tokens=4096,
             do_sample=True,
