@@ -4,70 +4,47 @@
 
 ---
 
-## 2026-05-14
+## 2026-05-14 — Session 1 Complete
 
-### Phase A.3 — Model Inspection ✅
+### Summary
 
-- `qwen-tts` pip package installs and imports correctly on Vast.ai
-- `phase_a_inspect_model.py` ran successfully and produced full module hierarchy
-- All critical architecture values confirmed (see findings.md)
-- `generate()` signature confirmed — real streaming supported via `non_streaming_mode=False`
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Environment setup | ✅ | RTX 5090, Python 3.14, venv, qwen-tts installed |
+| Phase A — Baseline inference | ✅ | WAV output working, RTF measured |
+| Phase D — Megakernel build | ✅ | Kernel patched, JIT built, single decode step confirmed |
+| Phase D — Full integration | ❌ Blocked | Prefill/vocoder boundary (see findings.md) |
+| Phase C — Pipecat pipeline | ⏳ Not started | Next priority |
+| Phase B — Real streaming | ⏳ Not started | After Phase C |
 
-### Phase A.2 — Package Discovery ✅
-
-- `qwen3_tts` is NOT part of HuggingFace `transformers` (any released version or source HEAD)
-- It is a standalone pip package: `pip install qwen-tts`
-- Class: `Qwen3TTSForConditionalGeneration` from `qwen_tts.core.models`
-- Processor: `Qwen3TTSProcessor` from `qwen_tts.core.models`
-
-### Environment ✅
-
-- Vast.ai instance: RTX 5090 (confirmed running)
-- Python 3.14, venv at `.venv/`
-- `qwen-tts` installed and importing correctly
-- flash-attn not installed (warning only — not blocking)
-
-### Scaffold ✅
-
-- All scripts, server, and client files created and pushed to GitHub
-- `git remote`: `git@github.com:noelsasi/qwen-megakernel-pipecat.git`
-
----
-
-### Phase A.4 — Baseline Inference ✅
-
-- `generate_custom_voice()` works correctly with speaker="Ryan", language="English"
-- WAV saved: `output_baseline.wav`, sr=24000 Hz (model returns 24000, not 12000 as assumed)
-- EOS token confirmed: 2150 (from pad_token_id warning)
-
-**Baseline numbers (RTX 5090, bfloat16, no flash-attn, no megakernel):**
+### Key Numbers
 
 | Metric | Value |
 |--------|-------|
-| Generation time | 8582 ± 853 ms |
-| Audio duration | ~9760 ms |
-| Sample rate | 24000 Hz |
-| **RTF** | **0.879** |
-| Target RTF < 0.15 | **FAIL** (5.9× too slow) |
+| Baseline RTF (HF, no megakernel, no flash-attn) | **0.879** |
+| Target RTF | < 0.15 |
+| Speedup needed | ~6× |
+| Audio sample rate | 24000 Hz |
+| EOS token ID | 2150 |
+| Model load time | ~5800 ms |
+| GPU | RTX 5090, CUDA 12.8 |
 
-RTF 0.879 means the model generates audio almost in real-time but NOT faster — this is the baseline we need to beat with the megakernel. The target (RTF < 0.15) requires ~6× speedup.
+### Phase D Blocker
+
+The megakernel single decode step works (`step(0) → token 112` confirmed). Full loop integration is blocked by:
+
+1. **Prefill incompatibility** — HF talker prefill uses `inputs_embeds` (mixed text + codec + speaker float tensors). Megakernel only accepts integer token IDs. No clean handoff point.
+2. **No public vocoder API** — `Qwen3TTSModel.generate_custom_voice()` buries the speech tokenizer (vocoder) call internally. No exposed method to run vocoder on custom codec token sequences.
+
+Both require deep reverse-engineering of `qwen_tts` internals. Deferred to next session.
 
 ---
 
-## Pending
+## Next Session Priorities
 
-- [ ] **Phase B** — Real streaming: hook `generate()` internals to yield audio chunks before full generation completes (reduces TTFC)
-- [ ] **Phase C** — Pipecat pipeline end-to-end (STT → LLM → TTS → speaker)
-- [ ] **Phase D** — Megakernel integration
-  - [x] Clone megakernel repo
-  - [x] Compat matrix complete — HEAD_DIM=128 ✅, NUM_HEADS=16 ✅, only VOCAB_SIZE wrong
-  - [x] Weight extraction code written (tts_backend_mk.py)
-  - [x] MRope cos/sin table builder written (interleaved, theta=1e6)
-  - [x] Patch kernel.cu: `LDG_VOCAB_SIZE 151936 → 3072` ✅
-  - [x] JIT build succeeds (`qwen_megakernel_C.so`) ✅
-  - [x] Single decode step works: `step(0) → token 112` ✅
-  - [ ] **BLOCKER:** Prefill uses mixed `inputs_embeds` (text + codec + speaker) — megakernel only accepts integer token IDs. Cannot directly hand off after HF prefill.
-  - [ ] Investigate Option A: monkey-patch talker.model.forward() post-prefill
-  - [ ] Fallback: flash-attn baseline + document integration blocker honestly
-- [ ] flash-attn install — likely gives meaningful speedup on RTX 5090
-- [ ] HF_TOKEN set on server (currently unauthenticated — hitting rate limits)
+- [ ] **Phase C** — Wire Pipecat pipeline end-to-end (STT → LLM → TTS → speaker)
+  - Server scaffold ready: `server/pipeline/voice_agent.py`
+  - Needs: LLM API key (OpenAI or Anthropic), STT choice (Deepgram key or Whisper local)
+- [ ] **flash-attn** — `pip install flash-attn --no-build-isolation` then re-run baseline (quick RTF improvement)
+- [ ] **Phase D continued** — Explore accessing `qwen_tts` vocoder internals to complete megakernel loop
+- [ ] **README** — Write with real numbers once demo is working
