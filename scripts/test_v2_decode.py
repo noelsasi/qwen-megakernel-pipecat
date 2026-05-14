@@ -235,21 +235,20 @@ def stage3b_timing(backend):
     torch.cuda.synchronize()
     t_pred = (time.perf_counter() - t0) / N_STEPS * 1000
 
-    # Time talker backbone only — must re-prefill each iteration to avoid
-    # KV cache growing across iterations (which causes dynamo recompilation)
+    # Time talker backbone decode step — re-prefill each iteration with the
+    # real prefill embeds so KV shape stays constant (avoids dynamo recompilation)
     t_talker_total = 0.0
-    embed = codec_embedding(token.unsqueeze(0).unsqueeze(0))
+    decode_embed = codec_embedding(token.unsqueeze(0).unsqueeze(0))  # [1,1,1024]
     with torch.inference_mode():
         for _ in range(N_STEPS):
-            # Fresh prefill each iteration so KV shape is always the same
             fresh_out = talker_model(
-                inputs_embeds=codec_embedding(token.unsqueeze(0).unsqueeze(0).expand(1, 18, -1)),
+                inputs_embeds=past_kv.layers[0].keys.new_zeros(1, 18, 1024),
                 use_cache=True, return_dict=True,
             )
             fresh_kv = fresh_out.past_key_values
             torch.cuda.synchronize()
             t0_step = time.perf_counter()
-            talker_model(inputs_embeds=embed, past_key_values=fresh_kv,
+            talker_model(inputs_embeds=decode_embed, past_key_values=fresh_kv,
                          use_cache=True, return_dict=True)
             torch.cuda.synchronize()
             t_talker_total += time.perf_counter() - t0_step
