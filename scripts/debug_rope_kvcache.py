@@ -123,8 +123,8 @@ if k_raw is not None:
         raw_h0_p1 = k_raw_r[1, 0].float()
         cached_h0_p1 = cached_k_r[1, 0].float()
         # pos=1 frequencies
-        cos_1 = torch.cos(inv_freq * 1.0)   # [64]
-        sin_1 = torch.sin(inv_freq * 1.0)   # [64]
+        cos_1 = torch.cos(inv_freq * 1.0).cuda()   # [64]
+        sin_1 = torch.sin(inv_freq * 1.0).cuda()   # [64]
 
         # Test adjacent-pair: cached[2i] = raw[2i]*cos[i] - raw[2i+1]*sin[i]
         adj_recon = torch.zeros(HEAD_DIM)
