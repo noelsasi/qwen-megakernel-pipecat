@@ -55,85 +55,32 @@ MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 # Prefill helpers
 # ---------------------------------------------------------------------------
 
-def _build_prefill_inputs(hf_model, text: str, speaker: str, language: str):
-    """
-    Reproduce the prefill embedding construction from generate_custom_voice().
-
-    Returns:
-        talker_input_embeds: [1, prefill_len, 1024] bfloat16
-        attention_mask: [1, prefill_len] int64
-        trailing_text_hiddens: [1, T, 1024] bfloat16 — text conditioning per decode step
-        tts_pad_embed: [1, 1, 1024] bfloat16
-
-    Strategy: call generate_custom_voice() with a hook to intercept the prefill
-    inputs before the talker.forward() is called, then abort.
-
-    This is safer than manually reconstructing the tokenization — the model's
-    tokenizer handles language/speaker/text formatting internally.
-    """
-    model = hf_model.model   # Qwen3TTSForConditionalGeneration
-    talker = model.talker    # Qwen3TTSTalkerForConditionalGeneration
-
-    captured = {}
-    orig_forward = talker.forward
-
-    def _intercept_forward(**kwargs):
-        # First call is prefill (inputs_embeds.shape[1] > 1)
-        if "inputs_embeds" in kwargs and kwargs["inputs_embeds"].shape[1] > 1:
-            captured["inputs_embeds"] = kwargs["inputs_embeds"].detach().clone()
-            captured["attention_mask"] = kwargs.get("attention_mask")
-            if captured["attention_mask"] is not None:
-                captured["attention_mask"] = captured["attention_mask"].detach().clone()
-            captured["trailing_text_hidden"] = kwargs.get("trailing_text_hidden")
-            if captured["trailing_text_hidden"] is not None:
-                captured["trailing_text_hidden"] = captured["trailing_text_hidden"].detach().clone()
-            captured["tts_pad_embed"] = kwargs.get("tts_pad_embed")
-            if captured["tts_pad_embed"] is not None:
-                captured["tts_pad_embed"] = captured["tts_pad_embed"].detach().clone()
-            captured["done"] = True
-            # Run the real prefill so we also get past_key_values
-            return orig_forward(**kwargs)
-        else:
-            # Abort after prefill — raise to exit generate_custom_voice early
-            raise _PrefillDone()
-
-    class _PrefillDone(Exception):
-        pass
-
-    talker.forward = _intercept_forward
-    try:
-        with torch.inference_mode():
-            hf_model.generate_custom_voice(
-                text=text,
-                language=language,
-                speaker=speaker,
-                max_new_tokens=1,
-                do_sample=False,
-            )
-    except _PrefillDone:
-        pass
-    finally:
-        talker.forward = orig_forward
-
-    if not captured.get("done"):
-        raise RuntimeError("Failed to capture prefill inputs — generate_custom_voice did not call talker.forward()")
-
-    return (
-        captured["inputs_embeds"],
-        captured["attention_mask"],
-        captured["trailing_text_hidden"],
-        captured["tts_pad_embed"],
-    )
-
 
 def _build_prefill_inputs_and_run(hf_model, text: str, speaker: str, language: str):
     """
     Run the prefill pass and return prefill outputs + captured conditioning tensors.
 
+    Strategy: patch talker.generate() (what generate_custom_voice() calls).
+    When generate() is called, we intercept its kwargs (which include inputs_embeds,
+    trailing_text_hidden, tts_pad_embed, etc.), run the prefill forward() manually,
+    then raise to abort the rest of generate_custom_voice().
+
+    generate_custom_voice() calls:
+        talker.generate(
+            inputs_embeds=prefill_embeds,       [1, prefill_len, 1024]
+            trailing_text_hidden=...,           [1, T, 1024]
+            tts_pad_embed=...,                  [1, 1, 1024]
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            max_new_tokens=...,
+            ...
+        )
+
     Returns:
         past_key_values: DynamicCache (28 layers of KV)
         past_hidden: [1, 1, 1024] — last hidden state
-        gen_step: int (usually 0 after prefill)
+        gen_step: int (0 after prefill)
         trailing_text_hiddens: [1, T, 1024]
         tts_pad_embed: [1, 1, 1024]
         logits: [1, 3072] — logits from last prefill position (for first token)
@@ -142,27 +89,43 @@ def _build_prefill_inputs_and_run(hf_model, text: str, speaker: str, language: s
     talker = model.talker
 
     captured = {}
-    orig_forward = talker.forward
+    orig_generate = talker.generate
 
     class _AbortAfterPrefill(Exception):
         pass
 
-    def _intercept(self_unused=None, **kwargs):
-        ie = kwargs.get("inputs_embeds")
-        if ie is not None and ie.shape[1] > 1:
-            # This is the prefill call — run it and capture results
-            result = orig_forward(**kwargs)
-            captured["trailing_text_hidden"] = kwargs.get("trailing_text_hidden")
-            captured["tts_pad_embed"] = kwargs.get("tts_pad_embed")
-            captured["prefill_result"] = result
-            raise _AbortAfterPrefill()
-        else:
-            # Decode step — abort (we'll run our own loop)
-            raise _AbortAfterPrefill()
+    def _intercept_generate(**kwargs):
+        # Extract the conditioning tensors generate_custom_voice passes to talker.generate()
+        inputs_embeds = kwargs.get("inputs_embeds")
+        trailing = kwargs.get("trailing_text_hidden")
+        tts_pad = kwargs.get("tts_pad_embed")
+        attention_mask = kwargs.get("attention_mask")
 
-    # Bind as unbound method-style callable
-    import functools
-    talker.forward = functools.partial(_intercept)
+        if inputs_embeds is None:
+            raise RuntimeError("talker.generate() called without inputs_embeds")
+
+        # Clone conditioning tensors before the generate call modifies any state
+        captured["trailing_text_hidden"] = trailing.detach().clone() if trailing is not None else None
+        captured["tts_pad_embed"] = tts_pad.detach().clone() if tts_pad is not None else None
+
+        # Run the prefill forward pass directly on talker (not via generate)
+        # talker.forward() with inputs_embeds.shape[1] > 1 is the prefill
+        prefill_result = talker.forward(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=trailing,
+            tts_pad_embed=tts_pad,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+        )
+        captured["prefill_result"] = prefill_result
+        raise _AbortAfterPrefill()
+
+    talker.generate = _intercept_generate
     try:
         with torch.inference_mode():
             hf_model.generate_custom_voice(
@@ -175,21 +138,33 @@ def _build_prefill_inputs_and_run(hf_model, text: str, speaker: str, language: s
     except _AbortAfterPrefill:
         pass
     except Exception as e:
-        logger.warning(f"Unexpected exception during prefill capture: {e}")
+        logger.warning(f"Unexpected exception during prefill capture: {e}", exc_info=True)
     finally:
-        talker.forward = orig_forward
+        talker.generate = orig_generate
 
     if "prefill_result" not in captured:
-        raise RuntimeError("Prefill capture failed — talker.forward() was not called with prefill inputs")
+        raise RuntimeError(
+            "Prefill capture failed — talker.generate() was not intercepted. "
+            "generate_custom_voice() may have a different call structure."
+        )
 
     result = captured["prefill_result"]
+
+    # past_hidden comes from talker.forward() output field
+    past_hidden = getattr(result, "past_hidden", None)
+    if past_hidden is None:
+        # Fallback: use last hidden state directly
+        past_hidden = result.last_hidden_state[:, -1:, :]
+
+    gen_step = getattr(result, "generation_step", 0) or 0
+
     return (
-        result.past_key_values,     # DynamicCache
-        result.past_hidden,         # [1, 1, 1024]
-        result.generation_step,     # int
-        captured["trailing_text_hidden"],   # [1, T, 1024]
-        captured["tts_pad_embed"],          # [1, 1, 1024]
-        result.logits[:, -1, :],            # [1, 3072]
+        result.past_key_values,                 # DynamicCache
+        past_hidden,                            # [1, 1, 1024]
+        gen_step,                               # int
+        captured["trailing_text_hidden"],       # [1, T, 1024]
+        captured["tts_pad_embed"],              # [1, 1, 1024]
+        result.logits[:, -1, :],               # [1, 3072]
     )
 
 

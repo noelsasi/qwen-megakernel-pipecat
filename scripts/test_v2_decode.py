@@ -30,6 +30,42 @@ SPEAKER = "Ryan"
 LANGUAGE = "English"
 
 
+def stage0_probe_generate_args(backend):
+    """Probe what kwargs generate_custom_voice() passes to talker.generate()."""
+    logger.info("=== STAGE 0: Probe talker.generate() kwargs ===")
+    model = backend._hf.model
+    talker = model.talker
+    orig_generate = talker.generate
+
+    def _probe(**kwargs):
+        logger.info("talker.generate() called with kwargs:")
+        for k, v in kwargs.items():
+            if hasattr(v, "shape"):
+                logger.info(f"  {k}: tensor {v.shape} {v.dtype}")
+            elif isinstance(v, (int, float, bool, str)) or v is None:
+                logger.info(f"  {k}: {v}")
+            else:
+                logger.info(f"  {k}: {type(v).__name__}")
+        raise RuntimeError("probe done")
+
+    talker.generate = _probe
+    try:
+        import torch
+        with torch.inference_mode():
+            backend._hf.generate_custom_voice(
+                text=TEST_TEXT, language=LANGUAGE, speaker=SPEAKER, max_new_tokens=1
+            )
+    except RuntimeError as e:
+        if "probe done" in str(e):
+            logger.info("STAGE 0 PASS — kwargs logged above")
+        else:
+            logger.error(f"STAGE 0 unexpected error: {e}")
+    except Exception as e:
+        logger.error(f"STAGE 0 error: {e}", exc_info=True)
+    finally:
+        talker.generate = orig_generate
+
+
 def stage1_prefill(backend):
     logger.info("=== STAGE 1: Prefill capture ===")
     from server.backend.tts_backend_v2 import _build_prefill_inputs_and_run
@@ -205,6 +241,11 @@ def main():
     logger.info("Loading QwenTTSBackendV2...")
     from server.backend.tts_backend_v2 import QwenTTSBackendV2
     backend = QwenTTSBackendV2()
+
+    logger.info("\n" + "="*60)
+
+    # Stage 0: Probe (helps debug if stage 1 fails)
+    stage0_probe_generate_args(backend)
 
     logger.info("\n" + "="*60)
 
