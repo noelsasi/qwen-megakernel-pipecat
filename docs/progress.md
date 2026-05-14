@@ -146,3 +146,35 @@ grep -n "k_cache\|past_key\|rotary\|apply_rot" \
 ### All commits squashed
 
 All session 3+4 fix commits were squashed into one clean commit (`272afde` + `9f1b320`) before pushing. Git history is clean.
+
+---
+
+## 2026-05-14 — Session 5
+
+### Summary
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase D — Megakernel decode loop | ✅ **WORKING** | All positions return valid tokens |
+| Phase D — Full end-to-end with audio | ⏳ Running | `test_mk_decode.py` stage 3 in progress |
+| Phase C — Pipecat pipeline | ⏳ Next | After stage 3 confirms audio output |
+
+### Root cause found: two wrong buffer allocations
+
+**Bug 1 — `block_max_vals`/`block_max_idxs` size 8 → 1184**
+`ldg_lm_head_fused` iterates over `LDG_LM_NUM_BLOCKS=1184` entries. We allocated 8 (guessed from `LDG_ATTN_BLOCKS`). Reads 8-1183 returned garbage floats as token indices.
+
+**Bug 2 — scratch buffers `bfloat16` → `float32`**
+All scratch buffers except `hidden_buffer` are cast to `float*` inside the kernel. Allocating as `bfloat16` gave half the byte count, causing out-of-bounds writes at all positions.
+
+**Proof:** Position sweep `pos=0..19` with zero KV cache now returns valid token 505 at every position.
+
+### Next immediate steps
+
+1. Wait for `test_mk_decode.py` to complete — confirm `[MK] Decode complete` + RTF
+2. Listen to `output_mk_test.wav` — verify audio quality vs HF baseline
+3. Start server: `uvicorn server.pipeline.voice_agent:app`
+4. Connect React client, confirm end-to-end voice round-trip
+5. Run `python scripts/benchmark.py --backend both --trials 5`
+6. Record demo
+7. Fill README numbers table

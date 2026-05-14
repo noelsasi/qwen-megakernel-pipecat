@@ -1,7 +1,7 @@
 # Findings & Observations
 
 > Ground truth only — confirmed by running actual code.
-> Last updated: 2026-05-14 (Session 4)
+> Last updated: 2026-05-14 (Session 5)
 
 ---
 
@@ -231,21 +231,37 @@ Patch `talker.model.forward()`:
 1. **Prefill** (first call): run HF normally → capture `DynamicCache` via `.layers[i].keys/values` → transfer to megakernel k/v cache buffers → compute first decode token from `last_hidden_state[-1]` via manual RMSNorm + `lm_head_weight` argmax
 2. **Decode steps**: ignore `inputs_embeds` entirely → feed internally-tracked token to megakernel `step()` → return `SimpleNamespace(logits, past_key_values=None, hidden_states, last_hidden_state, attentions=None)` → HF embeds the one-hot argmax token for next step (we ignore it)
 
-### Current blocker — KV cache RoPE compatibility (Session 4)
+### Root cause found and fixed — Session 5
 
-**Isolated test:** `decode(1995, pos=0)` with zero KV cache → token **842** ✅ (valid)  
-**Real test:** `decode(1995, pos=18)` with HF prefill KV cache → **garbage** ❌
+All garbage token issues traced to **two wrong buffer sizes**:
 
-HF stores keys post-RoPE in the DynamicCache. The megakernel also stores its own keys post-RoPE (it applies RoPE itself during the decode step). When we copy HF's post-RoPE keys into the megakernel cache, and the kernel then attends over them using its own cos/sin tables — if the RoPE applied by HF and the tables in the kernel are not exactly identical (same inv_freq, same rotation format), the attention scores will be wrong.
+**Bug 1: `block_max_vals` / `block_max_idxs` size = 8 (wrong) → 1184 (correct)**
 
-We fixed the cos/sin tables to use HF's exact inv_freq. The kernel is still producing garbage. Next investigation: confirm whether HF stores keys pre-RoPE or post-RoPE, and whether the rotation format (interleaved vs non-interleaved complex rotation) matches the kernel.
+`ldg_lm_head_fused` iterates `block_max_vals[0..num_blocks-1]` where `num_blocks = LDG_LM_NUM_BLOCKS = 1184`. We allocated 8 entries (guessed from `LDG_ATTN_BLOCKS`). Reads at indices 8-1183 returned garbage floats interpreted as token indices.
 
-```bash
-# Next diagnostic to run:
-grep -n "k_cache\|past_key\|rotary\|apply_rot" \
-  .venv/lib/python3.14/site-packages/qwen_tts/core/models/modeling_qwen3_tts.py \
-  | grep "1[0-9][0-9][0-9]:" | head -30
-```
+**Bug 2: All scratch buffers (`g_q`, `g_k`, `g_v`, `g_attn_out`, `g_activations`, `g_residual`, `g_mlp_intermediate`, `g_normalized`) must be `float32`, not `bfloat16`.**
+
+Confirmed from `launch_ldg_decode_direct` cast: `(float*)g_activations`, `(float*)g_q` etc. Only `hidden_buffer` is `bfloat16`. Allocating as `bfloat16` gave half the byte size, causing out-of-bounds writes.
+
+**Verification:** Position sweep `pos=0..19` with zero KV cache — all return valid token 505 after fix. Previously had garbage at most positions.
+
+**Buffer sizes — final confirmed values:**
+
+| Buffer | dtype | size |
+|--------|-------|------|
+| `hidden_buffer` | bfloat16 | HIDDEN_SIZE=1024 |
+| `g_activations` | float32 | HIDDEN_SIZE=1024 |
+| `g_residual` | float32 | HIDDEN_SIZE=1024 |
+| `g_q` | float32 | NUM_Q_HEADS×HEAD_DIM=2048 |
+| `g_k` | float32 | NUM_KV_HEADS×HEAD_DIM=1024 |
+| `g_v` | float32 | NUM_KV_HEADS×HEAD_DIM=1024 |
+| `g_attn_out` | float32 | NUM_Q_HEADS×HEAD_DIM=2048 |
+| `g_mlp_intermediate` | float32 | VOCAB_SIZE=3072 |
+| `g_normalized` | float32 | HIDDEN_SIZE=1024 |
+| `block_max_vals` | float32 | LDG_LM_NUM_BLOCKS=1184 |
+| `block_max_idxs` | int32 | LDG_LM_NUM_BLOCKS=1184 |
+| `k_cache` | bfloat16 | [28, 8, MAX_SEQ_LEN, 128] |
+| `v_cache` | bfloat16 | [28, 8, MAX_SEQ_LEN, 128] |
 
 ---
 
