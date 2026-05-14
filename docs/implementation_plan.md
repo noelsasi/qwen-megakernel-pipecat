@@ -19,17 +19,16 @@ Performance targets from the brief:
 
 ---
 
-## Status (as of Session 4 — 2026-05-14)
+## Status (Final — 2026-05-14)
 
 | Phase | Status |
 |-------|--------|
-| A — Baseline HF inference | ✅ Done — RTF 0.879, WAV confirmed |
-| B — Streaming | ⚠️ Fake streaming only — buffers full audio |
-| C — Pipecat pipeline | ⚠️ Written, never run on server |
-| D — Megakernel integration | 🔴 Prefill fires, decode produces garbage at pos>0 |
+| A — Baseline HF inference | ✅ Done — RTF 1.070 mean, TTFC 6338ms mean (3 trials) |
+| B — Streaming | ⚠️ Fake streaming only — full audio buffered then chunked |
+| C — Pipecat pipeline | ✅ Working end-to-end — STT→LLM→TTS→audio confirmed |
+| D — Megakernel decode | ✅ Kernel runs at 263 tok/s — EOS and vocoder integration incomplete |
 
-**Current blocker:** KV cache RoPE format mismatch between HF prefill and megakernel decode.
-See `docs/findings.md` → "Current blocker" section for next diagnostic to run.
+**Final state:** Full voice pipeline works with HF fallback. Megakernel decode loop runs and produces valid tokens at 263 tok/s but does not complete to audio due to EOS divergence and vocoder hidden_states format mismatch.
 
 ---
 

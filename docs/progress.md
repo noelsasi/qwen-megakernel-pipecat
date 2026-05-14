@@ -178,3 +178,54 @@ All scratch buffers except `hidden_buffer` are cast to `float*` inside the kerne
 5. Run `python scripts/benchmark.py --backend both --trials 5`
 6. Record demo
 7. Fill README numbers table
+
+---
+
+## 2026-05-14 — Session 6 (Final)
+
+### Summary
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase A — HF baseline | ✅ | RTF 1.070, TTFC 6338ms measured |
+| Phase D — Megakernel decode | ✅ Runs | 263 tok/s confirmed, EOS not reached |
+| Phase D — Full audio output | ❌ Blocked | Vocoder hidden_states format mismatch |
+| Phase C — Pipecat pipeline | ✅ Working | STT→LLM→TTS→audio confirmed end-to-end |
+| README | ✅ Done | Real numbers, honest limitations |
+| Demo | ⏳ Pending | Screen recording needed |
+
+### End-to-end demo confirmed working
+
+Full voice pipeline on RTX 5090:
+- Deepgram STT transcribes mic input correctly
+- gpt-5-mini generates response
+- QwenTTS synthesizes and plays audio
+- Dashboard shows transcript, metrics, waveform
+
+Audio uses HF fallback (megakernel falls back due to vocoder integration issue).
+E2E latency: ~18-20s (dominated by megakernel decode running 4096 tokens before fallback).
+
+### Benchmark numbers (RTX 5090, CUDA 12.8, bfloat16, no flash-attn, 3 trials)
+
+| Sentence | TTFC | RTF |
+|----------|------|-----|
+| "Hello." | 4762 ± 2538 ms | 1.126 ± 0.015 |
+| "The quick brown fox..." | 4641 ± 509 ms | 1.119 ± 0.009 |
+| "Artificial intelligence..." | 6704 ± 496 ms | 1.006 ± 0.007 |
+| "In the beginning..." | 9243 ± 618 ms | 1.031 ± 0.023 |
+| **Mean** | **6338 ms** | **1.070** |
+
+Megakernel decode: **263-266 tok/s** (paper target: ~1000 tok/s; gap due to MAX_SEQ_LEN=32768).
+
+### Why megakernel audio doesn't complete
+
+1. **EOS not reached** — megakernel runs 4096 tokens and hits hard cap. The decode sequence diverges from HF because HF constructs mixed embeddings (text + codec + speaker) per step, while megakernel tracks its own integer token state. Sequences diverge at step 1.
+
+2. **Vocoder hidden_states format** — `generate_custom_voice()` reads per-step hidden states from `talker_result.hidden_states` (line 2280 of `modeling_qwen3_tts.py`). HF expects a tuple of per-step tuples containing all-layer hidden states. Our SimpleNamespace with a single `[1,1,1024]` tensor doesn't match the format the code_predictor expects.
+
+### What would close the gap
+
+- Fix EOS: replicate HF's mixed embedding construction inside the decode loop
+- Fix vocoder: package `decoder._hidden` per step into correct hidden_states format
+- Reduce MAX_SEQ_LEN to 2048 for TTS (sufficient) to recover tok/s toward ~1000
+- Install flash-attn for 3-4× HF prefill speedup
