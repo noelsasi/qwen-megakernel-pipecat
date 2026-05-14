@@ -146,11 +146,16 @@ Source: `qwen_megakernel/csrc/kernel.cu` (confirmed from source) vs model config
 3. `Q_SIZE / KV_SIZE` — derived, auto-fixed when HEAD_DIM changes
 4. **Interleaved MRope** — standard RoPE in kernel must be replaced (see RoPE section below)
 
-**RoPE situation (critical):**
-- Kernel has standard RoPE only (grep confirms: no `mrope`, no `interleave`, no `mrope_section`)
-- Talker uses interleaved MRope with sections [24, 20, 20] and theta=1,000,000
-- MRope applies different rotation frequencies to different slices of each head dimension
-- This is not a constant change — requires rewriting the RoPE block in the kernel
+**RoPE situation — better than feared:**
+- Kernel RoPE reads from precomputed `cos_pos` / `sin_pos` pointer args — theta is NOT hardcoded
+- Inner loop is standard half-dimension rotation: `(i < HEAD_DIM/2) ? cos*x - sin*y : sin*y + cos*x`
+- **MRope does NOT require rewriting the kernel's inner loop**
+- MRope only requires computing the right `cos_pos`/`sin_pos` tables before calling the kernel
+- For interleaved MRope with sections [24, 20, 20]: different frequencies apply to dims [0:24], [24:44], [44:64]
+- This means we compute MRope cos/sin in Python/PyTorch before each decode step and pass them in
+- The kernel inner loop stays unchanged — only the cos/sin table generation changes
+
+**Revised assessment: MRope is a Python-side fix, not a CUDA rewrite.** Risk drops from CRITICAL to MEDIUM.
 
 **Summary:** 5 confirmed mismatches, 1 critical (MRope). Simple `#define` changes fix 4 of them. MRope requires actual kernel code changes.
 
