@@ -157,6 +157,32 @@ Source: `qwen_megakernel/csrc/kernel.cu` (confirmed from source) vs model config
 
 **Revised assessment: MRope is a Python-side fix, not a CUDA rewrite.** Risk drops from CRITICAL to MEDIUM.
 
+**Confirmed cos/sin table mechanics (from kernel.cu + model.py):**
+- Tables are `[MAX_SEQ_LEN, HEAD_DIM]` bfloat16 on GPU
+- Built once at init: `freqs = torch.outer(positions, inv_freq)`, then `cos(freqs).repeat(1,2)` and `sin(freqs).repeat(1,2)`
+- `.repeat(1,2)` duplicates the half-dim freqs to fill full HEAD_DIM (standard RoPE pattern)
+- Kernel indexes: `cos_pos = cos_table + position * HEAD_DIM` — single integer position, not multi-dim
+- **MRope fix:** Replace `torch.outer(positions, inv_freq)` with a concatenation of three frequency bands for mrope_sections [24,20,20], each with the same theta but different position_id streams (time, text, audio)
+- This is purely Python — the CUDA kernel is unchanged
+
+**Weight key mapping (confirmed from model.py):**
+```
+model.layers.{i}.input_layernorm.weight
+model.layers.{i}.self_attn.q_proj.weight
+model.layers.{i}.self_attn.k_proj.weight
+model.layers.{i}.self_attn.v_proj.weight
+model.layers.{i}.self_attn.q_norm.weight
+model.layers.{i}.self_attn.k_norm.weight
+model.layers.{i}.self_attn.o_proj.weight
+model.layers.{i}.post_attention_layernorm.weight
+model.layers.{i}.mlp.gate_proj.weight
+model.layers.{i}.mlp.up_proj.weight
+model.layers.{i}.mlp.down_proj.weight
+```
+These are the keys megakernel expects. Must verify these match `model.model.state_dict()` keys from the TTS talker.
+
+**LM head:** Uses tied embeddings (`lm_head_weight = embed_weight`). TTS talker has its own lm_head — NOT tied. Must pass talker's actual lm_head weight.
+
 **Summary:** 5 confirmed mismatches, 1 critical (MRope). Simple `#define` changes fix 4 of them. MRope requires actual kernel code changes.
 
 ---
