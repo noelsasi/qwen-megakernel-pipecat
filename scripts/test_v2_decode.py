@@ -144,6 +144,8 @@ def stage3_eos(backend):
     def on_chunk(chunk):
         frames_out.extend([chunk[i] for i in range(chunk.shape[0])])
 
+    # Cap at 200 frames (~16s audio) so we don't hang waiting for EOS
+    MAX_FRAMES = 200
     t0 = time.perf_counter()
     with torch.inference_mode():
         frames = _custom_decode_loop(
@@ -155,7 +157,7 @@ def stage3_eos(backend):
             tts_pad_embed=tts_pad,
             first_logits=first_logits,
             config=backend._config,
-            max_new_tokens=4096,
+            max_new_tokens=MAX_FRAMES,
             on_chunk=on_chunk,
             chunk_size=12,
         )
@@ -170,12 +172,16 @@ def stage3_eos(backend):
 
     logger.info(f"Decode: {n_frames} frames in {elapsed*1000:.0f}ms")
     logger.info(f"  Audio duration: {audio_dur:.2f}s")
-    logger.info(f"  tok/s: {n_frames / elapsed:.0f}")
+    logger.info(f"  tok/s (codec frames/s): {n_frames / elapsed:.1f}")
     logger.info(f"  EOS hit: {eos_hit}")
+    logger.info(f"  First 10 CB0 tokens: {cb0_tokens[:10]}")
+    logger.info(f"  Last 10 CB0 tokens: {cb0_tokens[-10:]}")
+    # Check token distribution
+    unique_tokens = set(cb0_tokens)
+    logger.info(f"  Unique CB0 tokens: {len(unique_tokens)} (healthy: > 20, stuck: <= 3)")
     if not eos_hit:
-        logger.warning(f"  EOS NOT hit — ran full {n_frames} frames. Sequence may be diverging.")
-        logger.info(f"  Last 5 CB0 tokens: {cb0_tokens[-5:]}")
-    logger.info("STAGE 3 PASS (with or without EOS)" if n_frames > 0 else "STAGE 3 FAIL (no frames)")
+        logger.warning(f"  EOS NOT hit after {MAX_FRAMES} frames — check token distribution above")
+    logger.info("STAGE 3 PASS" if eos_hit else f"STAGE 3 PARTIAL — {n_frames} frames, no EOS (capped at {MAX_FRAMES})")
     return frames
 
 

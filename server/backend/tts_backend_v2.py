@@ -212,17 +212,20 @@ def _custom_decode_loop(
     eos_id = EOS_TOKEN_ID
     vocab_size = config.vocab_size   # 3072
 
-    # Suppress high-range tokens (same suppression as faster-qwen3-tts)
-    suppress_start = max(0, vocab_size - 1024)
+    # Suppress artifact tokens in the top range, EOS=2150 must remain reachable.
+    # vocab_size=3072, suppress_start=2048. EOS=2150 is inside [2048, 3072).
+    # Strategy: suppress [2048:2150] and [2151:3072], leave 2150 (EOS) alone.
+    suppress_start = max(0, vocab_size - 1024)   # = 2048
+    assert eos_id > suppress_start, f"EOS {eos_id} must be > suppress_start {suppress_start}"
 
     def _sample(logits_1d: torch.Tensor, suppress_eos: bool) -> torch.Tensor:
         """Sample from [vocab_size] logits. Returns scalar int64 tensor."""
+        logits_1d = logits_1d.clone()
+        # Suppress high-artifact range, carving out EOS slot
+        logits_1d[suppress_start:eos_id] = float("-inf")   # [2048..2149]
+        logits_1d[eos_id + 1:] = float("-inf")             # [2151..3071]
         if suppress_eos:
-            logits_1d = logits_1d.clone()
             logits_1d[eos_id] = float("-inf")
-        # Suppress high tokens
-        logits_1d[suppress_start:] = float("-inf")
-        logits_1d[eos_id] = logits_1d[eos_id]  # restore eos if not suppressed
 
         if do_sample and temperature > 0:
             logits_1d = logits_1d / temperature
@@ -254,7 +257,11 @@ def _custom_decode_loop(
         last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))   # [1, 1, 1024]
         pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)         # [1, 2, 1024]
 
-        # code_predictor.generate() runs 15 autoregressive steps internally
+        # code_predictor.generate() runs 15 autoregressive steps internally.
+        # inputs_embeds has seq_len=2 (past_hidden + last_id_hidden), so HF
+        # generate() returns sequences of shape [1, 2 + 15] = [1, 17].
+        # The first 2 positions are not real token IDs (inputs_embeds had no
+        # corresponding input_ids). We want only the 15 newly generated tokens.
         predictor_result = predictor.generate(
             inputs_embeds=pred_input,
             max_new_tokens=num_code_groups - 1,
@@ -265,8 +272,10 @@ def _custom_decode_loop(
             output_hidden_states=False,
             return_dict_in_generate=True,
         )
-        # predictor_result.sequences: [1, 15] (generated token IDs for CB1..CB15)
-        codebook_token_ids = predictor_result.sequences[0]   # [15]
+        # sequences: [1, input_len + num_code_groups-1] — slice off the input prefix
+        seq = predictor_result.sequences[0]   # [input_len + 15]
+        input_len = pred_input.shape[1]       # = 2
+        codebook_token_ids = seq[input_len:]  # [15] — CB1..CB15
 
         # Full codec frame: CB0 + CB1..CB15
         all_cb = torch.cat([token.view(1), codebook_token_ids])   # [16]
@@ -313,6 +322,9 @@ def _custom_decode_loop(
         # Sample next CB0 token
         suppress_eos = step < min_new_tokens
         token = _sample(logits.squeeze(0), suppress_eos=suppress_eos)
+
+        if step_idx < 5 or step_idx % 20 == 0:
+            logger.debug(f"[v2] step={step_idx} token={token.item()} gen_step={gen_step} eos_suppressed={suppress_eos}")
 
         # --- Yield chunk if buffer full ---
         if len(chunk_buffer) >= chunk_size and on_chunk is not None:
