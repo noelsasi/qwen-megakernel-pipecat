@@ -1,52 +1,61 @@
 #!/usr/bin/env bash
-# Run this on the Vast.ai RTX 5090 instance after SSHing in.
-# Sets up Python venv, installs all dependencies, clones megakernel repo.
+# One-shot setup on RTX 5090 Vast.ai instance.
 # Usage: bash scripts/setup_server.sh
-
 set -euo pipefail
 
-echo "=== Vast.ai GPU server setup ==="
-echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'unknown')"
-echo "CUDA: $(nvcc --version 2>/dev/null | grep release || echo 'unknown')"
+echo "=== GPU info ==="
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+nvcc --version | grep release
 
 # System deps
-apt-get update -q && apt-get install -y -q libsndfile1 ffmpeg git curl
+apt-get update -q && apt-get install -y -q libsndfile1 ffmpeg git
 
-# Python venv (isolated — does not touch system packages)
+# Python venv
 python3 -m venv .venv
 source .venv/bin/activate
-echo "venv: $(which python)"
 
-# PyTorch with CUDA 12.8 (must be first — other packages depend on it)
+# PyTorch with CUDA 12.8 first — other packages depend on torch
 pip install --upgrade pip
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Verify GPU is accessible from PyTorch
 python -c "
 import torch
 assert torch.cuda.is_available(), 'CUDA not available!'
-print(f'PyTorch CUDA OK: {torch.cuda.get_device_name(0)}')
-print(f'CUDA version: {torch.version.cuda}')
+print(f'GPU: {torch.cuda.get_device_name(0)}  CUDA: {torch.version.cuda}')
 "
 
-# transformers from source (qwen3_tts not in any released version yet)
-pip install git+https://github.com/huggingface/transformers.git
-
-# Remaining project dependencies
+# Project deps
 pip install -r requirements.txt
 
-# Clone megakernel (Phase D)
+# Clone megakernel
 if [ ! -d "qwen_megakernel" ]; then
     git clone https://github.com/AlpinDale/qwen_megakernel
-    echo "Cloned qwen_megakernel"
-else
-    echo "qwen_megakernel already exists, skipping clone"
 fi
 
+# Patch kernel.cu: default vocab=151936 (text LLM), talker needs 3072 (codec tokens)
+sed -i 's/LDG_VOCAB_SIZE = 151936/LDG_VOCAB_SIZE = 3072/' qwen_megakernel/csrc/kernel.cu
+echo "Patched LDG_VOCAB_SIZE → 3072"
+
+# Build megakernel (targets sm_120a — RTX 5090 only)
+cd qwen_megakernel && pip install -e . && cd ..
+
+# Verify
+python -c "
+from qwen_megakernel.build import get_extension
+get_extension()
+import torch
+print('megakernel ops:', dir(torch.ops.qwen_megakernel_C))
+"
+
 echo ""
-echo "=== Setup complete ==="
-echo "Next steps:"
-echo "  1. Activate venv:  source .venv/bin/activate"
-echo "  2. Inspect model:  python scripts/phase_a_inspect_model.py 2>&1 | tee inspect_output.txt"
-echo "  3. Baseline TTS:   python scripts/phase_a_baseline.py"
-echo "  4. Start server:   uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000"
+echo "=== Setup done ==="
+echo ""
+echo "Copy and fill env:"
+echo "  cp .env.example .env && nano .env"
+echo ""
+echo "Run server:"
+echo "  source .venv/bin/activate"
+echo "  uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000"
+echo ""
+echo "Run benchmark:"
+echo "  python scripts/benchmark.py --backend megakernel"

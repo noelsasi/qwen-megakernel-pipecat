@@ -1,31 +1,30 @@
-# Install with: pip install -r requirements.txt
-# GPU: CUDA 12.8+, RTX 5090 — install torch FIRST with:
+# GPU: CUDA 12.8+, RTX 5090 (sm_120a)
+# Install torch FIRST:
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Core inference
-qwen-tts  # standalone package — NOT part of HuggingFace transformers
-transformers>=4.51.0  # still needed by pipecat and other deps
+# Qwen3-TTS (standalone pip package)
+qwen-tts
 huggingface_hub
 accelerate
 
-# Pipecat pipeline
-pipecat-ai[silero,google]>=0.0.50
+# Pipecat + Silero VAD
+pipecat-ai[silero]>=1.1.0
 
-# FastAPI server
+# STT + LLM
+deepgram-sdk
+openai
+
+# Server
 fastapi
 uvicorn[standard]
 websockets
 
-# Audio
+# Audio / numerics
 soundfile
 numpy
 
-# STT options (pick one at runtime, both listed for flexibility)
-openai-whisper
-deepgram-sdk
-
-# Build tooling (megakernel)
+# Megakernel build
 pybind11
 
-# Dev / benchmarking
+# Monitoring
 nvitop

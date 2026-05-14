@@ -342,6 +342,10 @@ class QwenTTSBackendMK:
     ):
         sys.path.insert(0, megakernel_path)
 
+        # Trigger JIT compilation and op registration before any torch.ops calls
+        from qwen_megakernel.build import get_extension
+        get_extension()
+
         from qwen_tts import Qwen3TTSModel
 
         print(f"[QwenTTSBackendMK] Loading HF model ...")

@@ -57,7 +57,7 @@ class QwenTTSBackendHF:
         )
         self.speaker = speaker
         self.language = language
-        self.sample_rate = None  # set on first inference from model return value
+        self.sample_rate = 24000  # confirmed: "12Hz" in model name = codec frame rate, audio is 24kHz
 
         print(f"[QwenTTSBackendHF] Loaded in {(time.perf_counter()-t0)*1000:.0f}ms")
         print(f"[QwenTTSBackendHF] Speaker={speaker} Language={language}")

@@ -16,11 +16,13 @@ import numpy as np
 from pipecat.services.tts_service import TTSService
 from pipecat.frames.frames import (
     Frame,
+    MetricsFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
     ErrorFrame,
 )
+from pipecat.metrics.metrics import TTFBMetricsData, ProcessingMetricsData
 
 
 class QwenTTSService(TTSService):
@@ -60,15 +62,19 @@ class QwenTTSService(TTSService):
             yield ErrorFrame(error=f"QwenTTS error: {e}")
             return
 
-        # Log metrics
+        # Emit metrics to pipeline (RTVIObserver converts to frontend RTVIEvent.Metrics)
         t_end = time.perf_counter()
         if t_first_chunk is not None and total_samples > 0:
-            ttfc_ms = (t_first_chunk - t_start) * 1000
+            ttfc_s = t_first_chunk - t_start
             gen_time = t_end - t_start
             audio_dur = total_samples / self._sample_rate
             rtf = gen_time / audio_dur if audio_dur > 0 else 0.0
             import logging
             logging.getLogger(__name__).info(
-                f"TTS metrics — TTFC={ttfc_ms:.0f}ms RTF={rtf:.3f} "
+                f"TTS metrics — TTFC={ttfc_s*1000:.0f}ms RTF={rtf:.3f} "
                 f"audio={audio_dur*1000:.0f}ms e2e={gen_time*1000:.0f}ms"
             )
+            yield MetricsFrame(data=[
+                TTFBMetricsData(processor="QwenTTSService", value=ttfc_s),
+                ProcessingMetricsData(processor="QwenTTSService", value=gen_time),
+            ])
