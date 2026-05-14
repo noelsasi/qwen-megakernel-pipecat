@@ -19,6 +19,9 @@ import time
 import logging
 import asyncio
 import numpy as np
+import torch
+
+torch.set_float32_matmul_precision("high")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -232,15 +235,25 @@ def stage3b_timing(backend):
     torch.cuda.synchronize()
     t_pred = (time.perf_counter() - t0) / N_STEPS * 1000
 
-    # Time talker backbone only (one decode step, no KV cache growth reset)
-    t0 = time.perf_counter()
+    # Time talker backbone only — must re-prefill each iteration to avoid
+    # KV cache growing across iterations (which causes dynamo recompilation)
+    t_talker_total = 0.0
     embed = codec_embedding(token.unsqueeze(0).unsqueeze(0))
     with torch.inference_mode():
         for _ in range(N_STEPS):
-            out = talker_model(inputs_embeds=embed, past_key_values=past_kv,
-                               use_cache=True, return_dict=True)
-    torch.cuda.synchronize()
-    t_talker = (time.perf_counter() - t0) / N_STEPS * 1000
+            # Fresh prefill each iteration so KV shape is always the same
+            fresh_out = talker_model(
+                inputs_embeds=codec_embedding(token.unsqueeze(0).unsqueeze(0).expand(1, 18, -1)),
+                use_cache=True, return_dict=True,
+            )
+            fresh_kv = fresh_out.past_key_values
+            torch.cuda.synchronize()
+            t0_step = time.perf_counter()
+            talker_model(inputs_embeds=embed, past_key_values=fresh_kv,
+                         use_cache=True, return_dict=True)
+            torch.cuda.synchronize()
+            t_talker_total += time.perf_counter() - t0_step
+    t_talker = t_talker_total / N_STEPS * 1000
 
     logger.info(f"  Predictor (15 steps): {t_pred:.1f}ms/frame")
     logger.info(f"  Talker backbone (1 step, 28L): {t_talker:.1f}ms/frame")

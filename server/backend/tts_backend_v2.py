@@ -38,11 +38,14 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Free ~10% speedup on Blackwell/Ampere via TF32 tensor cores for bfloat16 matmuls
+torch.set_float32_matmul_precision("high")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 24000
-CHUNK_FRAMES = 12      # yield audio every 12 codec frames = 960ms of audio
+CHUNK_FRAMES = 4       # 4 frames = 320ms audio per chunk; balances TTFC vs vocoder overhead
 CONTEXT_FRAMES = 25    # left-context window for causal codec decoder
 SAMPLES_PER_FRAME = SAMPLE_RATE // 12   # = 2000 samples = 80ms per codec frame
 # codec_eos_token_id from the actual model's config.json (Qwen3-TTS-12Hz-0.6B-CustomVoice):
