@@ -62,8 +62,8 @@ class TalkerGraph:
             hidden = tg.run(inputs_embeds, position=prefill_len + step)
     """
 
-    def __init__(self, talker_model, talker_config, device="cuda", dtype=torch.bfloat16,
-                 max_seq_len=512):
+    def __init__(self, talker_model, talker_config, codec_head=None,
+                 device="cuda", dtype=torch.bfloat16, max_seq_len=512):
         self.device = device
         self.dtype = dtype
         self.max_seq_len = max_seq_len
@@ -71,6 +71,7 @@ class TalkerGraph:
         self.num_layers = talker_config.num_hidden_layers
         self.config = talker_config
         self.model = talker_model
+        self.codec_head = codec_head  # nn.Linear(hidden, vocab) — included in graph if provided
 
         self.static_cache = StaticCache(config=talker_config, max_cache_len=max_seq_len)
 
@@ -78,6 +79,9 @@ class TalkerGraph:
         self.input_buf = torch.zeros(1, 1, self.hidden_size, dtype=dtype, device=device)
         self.output_buf = torch.zeros(1, 1, self.hidden_size, dtype=dtype, device=device)
         self.cache_position = torch.zeros(1, dtype=torch.long, device=device)
+        # logits_buf: only allocated if codec_head is captured in the graph
+        vocab_size = getattr(talker_config, "vocab_size", 3072)
+        self.logits_buf = torch.zeros(1, vocab_size, dtype=dtype, device=device) if codec_head else None
 
         # Attention mask lookup table — one per position, built at capture time
         self.attn_mask_table = None
@@ -109,6 +113,9 @@ class TalkerGraph:
             kwargs["attention_mask"] = self.attn_mask
         out = self.model(**kwargs)
         self.output_buf.copy_(out.last_hidden_state)
+        # Include codec_head in graph if provided — avoids separate Python matmul
+        if self.codec_head is not None:
+            self.logits_buf.copy_(self.codec_head(out.last_hidden_state[:, -1, :]))
 
     @torch.inference_mode()
     def capture(self, prefill_len=50, num_warmup=3):
@@ -162,19 +169,20 @@ class TalkerGraph:
         return seq_len
 
     @torch.inference_mode()
-    def run(self, input_embeds: torch.Tensor, position: int) -> torch.Tensor:
+    def run(self, input_embeds: torch.Tensor, position: int):
         """
         Run one decode step via CUDA graph replay.
         input_embeds: [1, 1, hidden_size]
         position: current sequence position (prefill_len + step_idx)
-        Returns: [1, 1, hidden_size] last hidden state (clone before next call)
+        Returns: (hidden [1,1,hidden], logits [1,vocab]) if codec_head captured,
+                 else (hidden [1,1,hidden], None)
         """
         self.input_buf.copy_(input_embeds)
         self.cache_position[0] = position
         if self.attn_mask is not None and position < len(self.attn_mask_table) and self.attn_mask_table[position] is not None:
             self.attn_mask.copy_(self.attn_mask_table[position])
         self.graph.replay()
-        return self.output_buf
+        return self.output_buf, self.logits_buf
 
 
 class PredictorGraph:

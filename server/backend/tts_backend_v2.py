@@ -274,6 +274,13 @@ def _custom_decode_loop(
 
         return torch.stack(cb_tokens)  # [15]
 
+    # Pre-stack predictor embedding weights for vectorized lookup — [15, vocab, hidden]
+    # Avoids 15-iteration Python loop per decode step.
+    _pred_cb_weights = torch.stack(
+        [predictor_codec_embeds[i].weight for i in range(num_code_groups - 1)]
+    )  # [15, 2048, 1024]
+    _cb_indices = torch.arange(num_code_groups - 1, device=device)  # [15]
+
     # First token from prefill logits
     token = _sample(first_logits.squeeze(0), suppress_eos=(min_new_tokens > 0))
 
@@ -309,12 +316,11 @@ def _custom_decode_loop(
         all_frames.append(all_cb.detach())
 
         # --- Build next-step input embedding ---
-        codec_hiddens = [last_id_hidden]
-        for i in range(num_code_groups - 1):
-            cb_tok = codebook_token_ids[i].unsqueeze(0).unsqueeze(0)
-            codec_hiddens.append(predictor_codec_embeds[i](cb_tok))
-
-        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)   # [1, 1, 1024]
+        # Vectorized: index into pre-stacked [15, 2048, 1024] weight tensor.
+        cb_embeds = _pred_cb_weights[_cb_indices, codebook_token_ids]  # [15, 1024]
+        # Sum CB0 (last_id_hidden squeezed) + CB1..15
+        inputs_embeds = last_id_hidden.squeeze(1) + cb_embeds.sum(0, keepdim=True)  # [1, 1024]
+        inputs_embeds = inputs_embeds.unsqueeze(1)  # [1, 1, 1024]
 
         # Add text conditioning
         if gen_step < trailing_text_hiddens.shape[1]:
@@ -324,12 +330,11 @@ def _custom_decode_loop(
 
         # --- Talker backbone: single decode step ---
         if talker_graph is not None:
-            # CUDA graph path: position = prefill_len + current step
-            hidden = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)   # [1, 1, 1024]
-            past_hidden = hidden[:, -1:, :].clone()
-            logits = codec_head(hidden[:, -1, :])
+            hidden, logits = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)
+            past_hidden = hidden[:, -1:, :].clone()  # clone: output_buf overwritten on next replay
+            if logits is None:
+                logits = codec_head(hidden[:, -1, :])
         else:
-            # Eager path: DynamicCache grows each step
             backbone_out = talker_model(
                 inputs_embeds=inputs_embeds,
                 past_key_values=past_key_values,
@@ -545,6 +550,7 @@ class QwenTTSBackendV2:
             self._talker_graph = TalkerGraph(
                 talker_model=talker.model,
                 talker_config=self._config,
+                codec_head=talker.codec_head,  # include in graph → logits come out directly
                 max_seq_len=512,
             )
             self._talker_graph.capture()
