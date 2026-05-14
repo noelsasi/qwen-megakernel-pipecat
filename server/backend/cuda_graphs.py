@@ -325,9 +325,14 @@ class PredictorGraph:
         """
         Run captured 15-step loop.
         pred_input: [1, 2, talker_hidden_size]
-        Returns: [15] long tensor — CB1..CB15 token IDs
+        Returns: [15] long tensor — CB1..CB15 token IDs, clamped to [0, 2047]
         """
         self.input_buf.copy_(pred_input)
         self.static_cache.reset()  # must be under inference_mode
         self.graph.replay()
-        return self.output_tokens.clone()  # clone so caller's tensor is independent
+        # Clamp output: graph output_tokens buffer could have stale/garbage values
+        # on first run or if sampling produces out-of-range indices.
+        # Predictor vocab = 2048 (each codebook has 2048 entries).
+        result = self.output_tokens.clone()
+        result.clamp_(0, 2047)
+        return result

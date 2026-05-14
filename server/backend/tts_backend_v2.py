@@ -317,7 +317,11 @@ def _custom_decode_loop(
 
         # --- Build next-step input embedding ---
         # Vectorized: index into pre-stacked [15, 2048, 1024] weight tensor.
-        cb_embeds = _pred_cb_weights[_cb_indices, codebook_token_ids]  # [15, 1024]
+        # Clamp tokens to valid range [0, pred_vocab-1] before indexing — graph output
+        # buffer may contain stale values on first replay that cause CUDA asserts.
+        pred_vocab = _pred_cb_weights.shape[1]  # 2048
+        safe_cb_ids = codebook_token_ids.clamp(0, pred_vocab - 1)
+        cb_embeds = _pred_cb_weights[_cb_indices, safe_cb_ids]  # [15, 1024]
         # Sum CB0 (last_id_hidden squeezed) + CB1..15
         inputs_embeds = last_id_hidden.squeeze(1) + cb_embeds.sum(0, keepdim=True)  # [1, 1024]
         inputs_embeds = inputs_embeds.unsqueeze(1)  # [1, 1, 1024]
