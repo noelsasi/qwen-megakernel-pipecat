@@ -1,0 +1,644 @@
+"""
+Phase 2 — Custom decode loop (Option B): correct architecture, real streaming.
+
+Architecture (verified from QwenLM/Qwen3-TTS + andimarafioti/faster-qwen3-tts):
+
+    Text
+      → prefill_embeds (text_projection + trailing_text_hiddens)
+      → talker.forward(prefill)                  → past_kv, past_hidden, gen_step=0
+      → DECODE LOOP per codec frame:
+          CB0_token = sample(logits)
+          last_id_hidden = codec_embedding(CB0_token)   [1, 1, 1024]
+          pred_input = cat(past_hidden, last_id_hidden) [1, 2, 1024]
+          CB1..15 = code_predictor(pred_input)          [15]
+          all_cb = cat(CB0, CB1..15)                    [16]  ← codec frame
+          inputs_embeds = sum(16 codec embeds) + text_cond  [1, 1, 1024]
+          hidden = talker.model.forward(inputs_embeds, past_kv)
+          logits = lm_head(RMSNorm(hidden[:, -1]))      [3072]
+          past_hidden = hidden[:, -1:, :]               [1, 1, 1024]
+          gen_step += 1
+      → CHUNK VOCODING every CHUNK_FRAMES frames:
+          window = all_codes[max(0, n-CONTEXT_FRAMES):n]
+          audio = speech_tokenizer.decode(window)
+          yield trimmed_new_audio
+
+DO NOT modify: existing HF pipeline, voice_agent.py, tts_backend_mk.py, tts_backend_hf.py.
+This is a new isolated module. Wire it in by setting TTS_BACKEND=v2 in voice_agent.py.
+"""
+
+import asyncio
+import sys
+import time
+import logging
+from collections.abc import AsyncGenerator
+
+import numpy as np
+import torch
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SAMPLE_RATE = 24000
+CHUNK_FRAMES = 12      # yield audio every 12 codec frames = 960ms of audio
+CONTEXT_FRAMES = 25    # left-context window for causal codec decoder
+SAMPLES_PER_FRAME = SAMPLE_RATE // 12   # = 2000 samples = 80ms per codec frame
+EOS_TOKEN_ID = 2150
+MAX_NEW_TOKENS = 4096
+MIN_NEW_TOKENS = 2
+
+MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+
+# ---------------------------------------------------------------------------
+# Prefill helpers
+# ---------------------------------------------------------------------------
+
+def _build_prefill_inputs(hf_model, text: str, speaker: str, language: str):
+    """
+    Reproduce the prefill embedding construction from generate_custom_voice().
+
+    Returns:
+        talker_input_embeds: [1, prefill_len, 1024] bfloat16
+        attention_mask: [1, prefill_len] int64
+        trailing_text_hiddens: [1, T, 1024] bfloat16 — text conditioning per decode step
+        tts_pad_embed: [1, 1, 1024] bfloat16
+
+    Strategy: call generate_custom_voice() with a hook to intercept the prefill
+    inputs before the talker.forward() is called, then abort.
+
+    This is safer than manually reconstructing the tokenization — the model's
+    tokenizer handles language/speaker/text formatting internally.
+    """
+    model = hf_model.model   # Qwen3TTSForConditionalGeneration
+    talker = model.talker    # Qwen3TTSTalkerForConditionalGeneration
+
+    captured = {}
+    orig_forward = talker.forward
+
+    def _intercept_forward(**kwargs):
+        # First call is prefill (inputs_embeds.shape[1] > 1)
+        if "inputs_embeds" in kwargs and kwargs["inputs_embeds"].shape[1] > 1:
+            captured["inputs_embeds"] = kwargs["inputs_embeds"].detach().clone()
+            captured["attention_mask"] = kwargs.get("attention_mask")
+            if captured["attention_mask"] is not None:
+                captured["attention_mask"] = captured["attention_mask"].detach().clone()
+            captured["trailing_text_hidden"] = kwargs.get("trailing_text_hidden")
+            if captured["trailing_text_hidden"] is not None:
+                captured["trailing_text_hidden"] = captured["trailing_text_hidden"].detach().clone()
+            captured["tts_pad_embed"] = kwargs.get("tts_pad_embed")
+            if captured["tts_pad_embed"] is not None:
+                captured["tts_pad_embed"] = captured["tts_pad_embed"].detach().clone()
+            captured["done"] = True
+            # Run the real prefill so we also get past_key_values
+            return orig_forward(**kwargs)
+        else:
+            # Abort after prefill — raise to exit generate_custom_voice early
+            raise _PrefillDone()
+
+    class _PrefillDone(Exception):
+        pass
+
+    talker.forward = _intercept_forward
+    try:
+        with torch.inference_mode():
+            hf_model.generate_custom_voice(
+                text=text,
+                language=language,
+                speaker=speaker,
+                max_new_tokens=1,
+                do_sample=False,
+            )
+    except _PrefillDone:
+        pass
+    finally:
+        talker.forward = orig_forward
+
+    if not captured.get("done"):
+        raise RuntimeError("Failed to capture prefill inputs — generate_custom_voice did not call talker.forward()")
+
+    return (
+        captured["inputs_embeds"],
+        captured["attention_mask"],
+        captured["trailing_text_hidden"],
+        captured["tts_pad_embed"],
+    )
+
+
+def _build_prefill_inputs_and_run(hf_model, text: str, speaker: str, language: str):
+    """
+    Run the prefill pass and return prefill outputs + captured conditioning tensors.
+
+    Returns:
+        past_key_values: DynamicCache (28 layers of KV)
+        past_hidden: [1, 1, 1024] — last hidden state
+        gen_step: int (usually 0 after prefill)
+        trailing_text_hiddens: [1, T, 1024]
+        tts_pad_embed: [1, 1, 1024]
+        logits: [1, 3072] — logits from last prefill position (for first token)
+    """
+    model = hf_model.model
+    talker = model.talker
+
+    captured = {}
+    orig_forward = talker.forward
+
+    class _AbortAfterPrefill(Exception):
+        pass
+
+    def _intercept(self_unused=None, **kwargs):
+        ie = kwargs.get("inputs_embeds")
+        if ie is not None and ie.shape[1] > 1:
+            # This is the prefill call — run it and capture results
+            result = orig_forward(**kwargs)
+            captured["trailing_text_hidden"] = kwargs.get("trailing_text_hidden")
+            captured["tts_pad_embed"] = kwargs.get("tts_pad_embed")
+            captured["prefill_result"] = result
+            raise _AbortAfterPrefill()
+        else:
+            # Decode step — abort (we'll run our own loop)
+            raise _AbortAfterPrefill()
+
+    # Bind as unbound method-style callable
+    import functools
+    talker.forward = functools.partial(_intercept)
+    try:
+        with torch.inference_mode():
+            hf_model.generate_custom_voice(
+                text=text,
+                language=language,
+                speaker=speaker,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+            )
+    except _AbortAfterPrefill:
+        pass
+    except Exception as e:
+        logger.warning(f"Unexpected exception during prefill capture: {e}")
+    finally:
+        talker.forward = orig_forward
+
+    if "prefill_result" not in captured:
+        raise RuntimeError("Prefill capture failed — talker.forward() was not called with prefill inputs")
+
+    result = captured["prefill_result"]
+    return (
+        result.past_key_values,     # DynamicCache
+        result.past_hidden,         # [1, 1, 1024]
+        result.generation_step,     # int
+        captured["trailing_text_hidden"],   # [1, T, 1024]
+        captured["tts_pad_embed"],          # [1, 1, 1024]
+        result.logits[:, -1, :],            # [1, 3072]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decode loop
+# ---------------------------------------------------------------------------
+
+@torch.inference_mode()
+def _custom_decode_loop(
+    talker,
+    past_key_values,
+    past_hidden: torch.Tensor,
+    gen_step: int,
+    trailing_text_hiddens: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+    first_logits: torch.Tensor,
+    config,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+    min_new_tokens: int = MIN_NEW_TOKENS,
+    do_sample: bool = True,
+    temperature: float = 0.9,
+    top_k: int = 50,
+    top_p: float = 1.0,
+    chunk_size: int = CHUNK_FRAMES,
+    on_chunk=None,  # callback(codec_chunk: torch.Tensor [chunk, 16]) called per chunk
+):
+    """
+    Custom autoregressive decode loop owning the full generation runtime.
+
+    Calls talker.model.forward() directly (bypassing talker.forward() / talker.generate()).
+    Handles: code predictor, codec embedding reconstruction, text conditioning.
+    Calls on_chunk(codec_chunk) every chunk_size frames.
+
+    Returns: list of all [16]-tensors (one per codec frame)
+    """
+    device = past_hidden.device
+    talker_model = talker.model   # Qwen3Model (the backbone)
+    codec_head = talker.codec_head        # [3072, 1024] lm_head
+    codec_embedding = talker.get_input_embeddings()   # nn.Embedding(3072, 1024)
+
+    predictor = talker.code_predictor
+    predictor_codec_embeds = predictor.get_input_embeddings()   # list of 15 Embedding(2048, 1024)
+    num_code_groups = config.num_code_groups   # 16
+
+    eos_id = EOS_TOKEN_ID
+    vocab_size = config.vocab_size   # 3072
+
+    # Suppress high-range tokens (same suppression as faster-qwen3-tts)
+    suppress_start = max(0, vocab_size - 1024)
+
+    def _sample(logits_1d: torch.Tensor, suppress_eos: bool) -> torch.Tensor:
+        """Sample from [vocab_size] logits. Returns scalar int64 tensor."""
+        if suppress_eos:
+            logits_1d = logits_1d.clone()
+            logits_1d[eos_id] = float("-inf")
+        # Suppress high tokens
+        logits_1d[suppress_start:] = float("-inf")
+        logits_1d[eos_id] = logits_1d[eos_id]  # restore eos if not suppressed
+
+        if do_sample and temperature > 0:
+            logits_1d = logits_1d / temperature
+            if top_k > 0:
+                topk_vals = torch.topk(logits_1d, min(top_k, logits_1d.size(-1))).values
+                logits_1d = logits_1d.masked_fill(logits_1d < topk_vals[-1], float("-inf"))
+            probs = torch.softmax(logits_1d, dim=-1)
+            return torch.multinomial(probs, 1).squeeze()
+        else:
+            return logits_1d.argmax()
+
+    # First token from prefill logits
+    token = _sample(first_logits.squeeze(0), suppress_eos=(min_new_tokens > 0))
+
+    all_frames = []
+    chunk_buffer = []
+    step = 0
+
+    # Build attention mask incrementally (start with prefill length from past_kv)
+    # We'll let HF manage attention mask via DynamicCache — just pass None and let
+    # the model handle causal masking automatically
+
+    for step_idx in range(max_new_tokens):
+        if token.item() == eos_id:
+            logger.debug(f"[v2] EOS at step {step_idx}")
+            break
+
+        # --- Code predictor: produce CB1..CB15 ---
+        last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))   # [1, 1, 1024]
+        pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)         # [1, 2, 1024]
+
+        # code_predictor.generate() runs 15 autoregressive steps internally
+        predictor_result = predictor.generate(
+            inputs_embeds=pred_input,
+            max_new_tokens=num_code_groups - 1,
+            do_sample=do_sample,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            output_hidden_states=False,
+            return_dict_in_generate=True,
+        )
+        # predictor_result.sequences: [1, 15] (generated token IDs for CB1..CB15)
+        codebook_token_ids = predictor_result.sequences[0]   # [15]
+
+        # Full codec frame: CB0 + CB1..CB15
+        all_cb = torch.cat([token.view(1), codebook_token_ids])   # [16]
+        chunk_buffer.append(all_cb.detach())
+        all_frames.append(all_cb.detach())
+
+        # --- Build next-step input embedding ---
+        # Sum of 16 codec embeddings: CB0 from talker embed, CB1..15 from predictor embeds
+        codec_hiddens = [last_id_hidden]   # [1, 1, 1024]
+        for i in range(num_code_groups - 1):
+            cb_tok = codebook_token_ids[i].unsqueeze(0).unsqueeze(0)   # [1, 1]
+            codec_hiddens.append(predictor_codec_embeds[i](cb_tok))    # [1, 1, 1024]
+
+        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)   # [1, 16, 1024] → [1, 1, 1024]
+
+        # Add text conditioning
+        if gen_step < trailing_text_hiddens.shape[1]:
+            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
+        else:
+            inputs_embeds = inputs_embeds + tts_pad_embed
+
+        # --- Talker backbone forward (single decode step) ---
+        # Call talker.model (the Qwen3Model backbone) directly, bypassing talker.forward()
+        # so we control KV cache and embedding — no code predictor called inside
+        backbone_out = talker_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+
+        hidden = backbone_out.last_hidden_state    # [1, 1, 1024]
+        past_key_values = backbone_out.past_key_values
+
+        # Next token logits
+        logits = codec_head(hidden[:, -1, :])      # [1, 3072]
+
+        # Update recurrent state
+        past_hidden = hidden[:, -1:, :].clone()    # [1, 1, 1024]
+        gen_step += 1
+        step = step_idx + 1
+
+        # Sample next CB0 token
+        suppress_eos = step < min_new_tokens
+        token = _sample(logits.squeeze(0), suppress_eos=suppress_eos)
+
+        # --- Yield chunk if buffer full ---
+        if len(chunk_buffer) >= chunk_size and on_chunk is not None:
+            chunk_tensor = torch.stack(chunk_buffer)   # [chunk_size, 16]
+            on_chunk(chunk_tensor)
+            chunk_buffer = []
+
+    # Final partial chunk
+    if chunk_buffer and on_chunk is not None:
+        chunk_tensor = torch.stack(chunk_buffer)
+        on_chunk(chunk_tensor)
+
+    logger.info(f"[v2] Decode complete — {step} codec frames, {step * SAMPLES_PER_FRAME / SAMPLE_RATE:.2f}s audio")
+    # all_frames is populated incrementally via all_frames.append() above
+    return all_frames  # list of [16] tensors, one per codec frame
+
+
+# ---------------------------------------------------------------------------
+# Incremental vocoder
+# ---------------------------------------------------------------------------
+
+class _IncrementalVocoder:
+    """
+    Wraps speech_tokenizer to emit audio incrementally with left-context windowing.
+
+    Codec decoder is a causal ConvNet — needs ~25 frames of left context for
+    accurate reconstruction. We re-decode a window of (context + new) frames
+    and trim to emit only the new samples.
+    """
+
+    def __init__(self, speech_tokenizer, context_frames: int = CONTEXT_FRAMES):
+        self._tokenizer = speech_tokenizer
+        self._context_frames = context_frames
+        self._all_codes: list[torch.Tensor] = []  # list of [16] tensors
+        self._emitted_frames = 0
+
+    def _decode_window(self, window_codes: torch.Tensor) -> np.ndarray:
+        """
+        Call speech_tokenizer.decode() on window_codes [n_frames, 16].
+        Returns float32 numpy array of waveform samples.
+
+        API: speech_tokenizer.decode([{"audio_codes": codes}]) returns (wav_list, sr)
+        where wav_list[0] is a float32 numpy array of shape [n_samples].
+        """
+        window = window_codes.long()  # ensure int64
+        result = self._tokenizer.decode([{"audio_codes": window}])
+        if isinstance(result, (tuple, list)) and len(result) == 2:
+            audio_data, sr = result
+            if isinstance(audio_data, (list, tuple)):
+                audio_arr = audio_data[0] if audio_data else np.zeros(0, dtype=np.float32)
+            else:
+                audio_arr = audio_data
+        else:
+            audio_arr = result
+
+        if hasattr(audio_arr, "cpu"):
+            audio_arr = audio_arr.cpu().float().numpy()
+        return np.asarray(audio_arr, dtype=np.float32).squeeze()
+
+    def add_chunk(self, codec_chunk: torch.Tensor) -> bytes:
+        """
+        Add codec_chunk ([N, 16]) and return new audio bytes (int16 PCM, 24kHz).
+        """
+        for i in range(codec_chunk.shape[0]):
+            self._all_codes.append(codec_chunk[i])
+
+        n_total = len(self._all_codes)
+        n_new = n_total - self._emitted_frames
+        if n_new <= 0:
+            return b""
+
+        ctx_start = max(0, n_total - self._context_frames - n_new)
+        window_frames = torch.stack(self._all_codes[ctx_start:n_total])   # [ctx+new, 16]
+
+        try:
+            audio_arr = self._decode_window(window_frames)
+
+            # Trim to only new samples (the tail of the decoded audio)
+            new_samples = n_new * SAMPLES_PER_FRAME
+            if len(audio_arr) > new_samples:
+                audio_arr = audio_arr[-new_samples:]
+
+            self._emitted_frames = n_total
+            return (np.clip(audio_arr, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+        except Exception as e:
+            logger.error(f"[v2] Vocoder error: {e}", exc_info=True)
+            self._emitted_frames = n_total
+            return bytes(n_new * SAMPLES_PER_FRAME * 2)   # silence
+
+    def flush(self, full_codes: list[torch.Tensor]) -> bytes:
+        """
+        Final flush: vocode remaining frames not yet emitted.
+        Uses the full code sequence for best tail quality.
+        """
+        n_total = len(full_codes)
+        n_remaining = n_total - self._emitted_frames
+        if n_remaining <= 0:
+            return b""
+
+        try:
+            all_frames = torch.stack(full_codes)   # [T, 16]
+            audio_arr = self._decode_window(all_frames)
+
+            tail_samples = n_remaining * SAMPLES_PER_FRAME
+            if len(audio_arr) > tail_samples:
+                audio_arr = audio_arr[-tail_samples:]
+
+            return (np.clip(audio_arr, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        except Exception as e:
+            logger.error(f"[v2] Vocoder flush error: {e}", exc_info=True)
+            return bytes(n_remaining * SAMPLES_PER_FRAME * 2)
+
+
+# ---------------------------------------------------------------------------
+# Backend
+# ---------------------------------------------------------------------------
+
+class QwenTTSBackendV2:
+    """
+    Phase 2 backend — custom decode loop with correct codec frame generation.
+
+    Differences from QwenTTSBackendMK (v1):
+    - Owns the FULL decode loop (no HF generate() call)
+    - Calls code_predictor correctly per step
+    - Builds codec embedding reconstruction (16 codebooks summed)
+    - Applies trailing_text_hiddens conditioning per step
+    - Streams audio chunks from vocoder incrementally (true streaming)
+
+    Drop-in compatible with QwenTTSService (same synthesize_streaming() interface).
+    """
+
+    def __init__(
+        self,
+        model_id: str = MODEL_ID,
+        speaker: str = "Ryan",
+        language: str = "English",
+        megakernel_path: str = "./qwen_megakernel",
+    ):
+        from qwen_tts import Qwen3TTSModel
+
+        logger.info("[v2] Loading Qwen3-TTS model...")
+        t0 = time.perf_counter()
+
+        self._hf = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map="cuda",
+            dtype=torch.bfloat16,
+        )
+        self._hf.model.eval()
+        self._speaker = speaker
+        self._language = language
+        self.sample_rate = SAMPLE_RATE
+
+        # Cache handles to modules we need directly
+        model = self._hf.model
+        self._talker = model.talker
+        self._config = model.talker.config
+        self._speech_tokenizer = model.speech_tokenizer
+
+        logger.info(f"[v2] Ready in {(time.perf_counter()-t0)*1000:.0f}ms")
+        logger.info(f"[v2] num_code_groups={self._config.num_code_groups}, vocab_size={self._config.vocab_size}")
+
+    def _run_custom_decode(self, text: str) -> tuple[list, float]:
+        """
+        Run full custom decode. Returns (all_frames, decode_time_s).
+        Raises on error — caller handles fallback.
+        """
+        logger.info(f"[v2] Starting custom decode for: {text[:60]!r}")
+        t0 = time.perf_counter()
+
+        past_kv, past_hidden, gen_step, trailing, tts_pad, first_logits = \
+            _build_prefill_inputs_and_run(
+                self._hf, text, self._speaker, self._language
+            )
+
+        t_prefill = time.perf_counter() - t0
+        logger.info(f"[v2] Prefill done in {t_prefill*1000:.0f}ms, gen_step={gen_step}")
+
+        frames = _custom_decode_loop(
+            talker=self._talker,
+            past_key_values=past_kv,
+            past_hidden=past_hidden,
+            gen_step=gen_step,
+            trailing_text_hiddens=trailing,
+            tts_pad_embed=tts_pad,
+            first_logits=first_logits,
+            config=self._config,
+        )
+
+        t_decode = time.perf_counter() - t0
+        return frames, t_decode
+
+    def _run_hf_fallback(self, text: str) -> np.ndarray:
+        """Pure HF inference — unchanged backup path."""
+        wavs, sr = self._hf.generate_custom_voice(
+            text=text,
+            language=self._language,
+            speaker=self._speaker,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=True,
+            temperature=0.9,
+        )
+        return np.array(wavs[0], dtype=np.float32).squeeze()
+
+    async def synthesize_streaming(
+        self, text: str
+    ) -> AsyncGenerator[tuple[bytes, int], None]:
+        """
+        Yields (audio_bytes: bytes, sample_rate: int) in ~CHUNK_FRAMES*80ms chunks.
+        Uses custom decode loop with real streaming.
+        Falls back to HF batch if custom decode fails.
+        """
+        loop = asyncio.get_event_loop()
+
+        # Run the blocking decode in a thread executor
+        # We use a queue to stream results from the executor thread to the async generator
+        audio_queue: asyncio.Queue = asyncio.Queue()
+        vocoder = _IncrementalVocoder(self._speech_tokenizer)
+        all_frames_ref = []
+        decode_error = None
+
+        def _decode_thread():
+            nonlocal decode_error
+            try:
+                t_start = time.perf_counter()
+
+                past_kv, past_hidden, gen_step, trailing, tts_pad, first_logits = \
+                    _build_prefill_inputs_and_run(
+                        self._hf, text, self._speaker, self._language
+                    )
+
+                t_prefill = time.perf_counter() - t_start
+                logger.info(
+                    f"[v2] Prefill {t_prefill*1000:.0f}ms, gen_step={gen_step}, "
+                    f"trailing_len={trailing.shape[1] if trailing is not None else 0}"
+                )
+
+                def _on_chunk(chunk: torch.Tensor):
+                    # chunk: [CHUNK_FRAMES, 16] or smaller for final chunk
+                    audio_bytes = vocoder.add_chunk(chunk)
+                    if audio_bytes:
+                        asyncio.run_coroutine_threadsafe(
+                            audio_queue.put(audio_bytes), loop
+                        ).result()
+
+                frames = _custom_decode_loop(
+                    talker=self._talker,
+                    past_key_values=past_kv,
+                    past_hidden=past_hidden,
+                    gen_step=gen_step,
+                    trailing_text_hiddens=trailing,
+                    tts_pad_embed=tts_pad,
+                    first_logits=first_logits,
+                    config=self._config,
+                    chunk_size=CHUNK_FRAMES,
+                    on_chunk=_on_chunk,
+                )
+                all_frames_ref.extend(frames)
+
+                # Flush tail using the full frame list for best quality
+                tail = vocoder.flush(all_frames_ref)
+                if tail:
+                    asyncio.run_coroutine_threadsafe(
+                        audio_queue.put(tail), loop
+                    ).result()
+
+            except Exception as e:
+                logger.error(f"[v2] Decode thread error: {e}", exc_info=True)
+                decode_error = e
+            finally:
+                asyncio.run_coroutine_threadsafe(
+                    audio_queue.put(None), loop  # sentinel — signals end of stream
+                ).result()
+
+        try:
+            executor_fut = loop.run_in_executor(None, _decode_thread)
+
+            while True:
+                chunk = await audio_queue.get()
+                if chunk is None:
+                    break
+                yield chunk, self.sample_rate
+
+            await executor_fut  # propagate any thread exception
+
+            if decode_error is not None:
+                logger.warning("[v2] Custom decode failed, falling back to HF")
+                audio = await loop.run_in_executor(None, self._run_hf_fallback, text)
+                chunk_samples = int(self.sample_rate * 100 / 1000)
+                for i in range(0, len(audio), chunk_samples):
+                    chunk = audio[i:i+chunk_samples]
+                    yield (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16).tobytes(), self.sample_rate
+                    await asyncio.sleep(0)
+
+        except Exception as e:
+            logger.error(f"[v2] synthesize_streaming error: {e}", exc_info=True)
+            # Last resort: HF fallback
+            audio = await loop.run_in_executor(None, self._run_hf_fallback, text)
+            chunk_samples = int(self.sample_rate * 100 / 1000)
+            for i in range(0, len(audio), chunk_samples):
+                chunk = audio[i:i+chunk_samples]
+                yield (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16).tobytes(), self.sample_rate
+                await asyncio.sleep(0)

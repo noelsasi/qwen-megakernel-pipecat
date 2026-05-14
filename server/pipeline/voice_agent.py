@@ -1,15 +1,20 @@
 """
 Qwen3-TTS + megakernel voice agent.
 
-Flow: mic → Deepgram STT → OpenAI LLM → QwenTTS (megakernel) → speaker
+Flow: mic → Deepgram STT → OpenAI LLM → QwenTTS → speaker
 
 Env vars (required):
   OPENAI_API_KEY      gpt-4o-mini for LLM
   DEEPGRAM_API_KEY    Deepgram for STT (fast, low-latency)
   ALLOWED_ORIGIN      CORS origin, e.g. https://your-app.vercel.app (default: *)
 
+TTS_BACKEND options (set as env var):
+  megakernel  (default) — Phase 1 monkey-patch backend (HF fallback in practice)
+  v2                    — Phase 2 custom decode loop (correct architecture, real streaming)
+  hf                    — Pure HF baseline, no megakernel
+
 Start:
-  TTS_BACKEND=megakernel uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+  TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
 """
 
 import asyncio
@@ -34,9 +39,20 @@ SYSTEM_PROMPT = (
 
 def _load_backend():
     global _tts_backend
-    from server.backend.tts_backend_mk import QwenTTSBackendMK
-    _tts_backend = QwenTTSBackendMK()
-    logger.info("Megakernel backend ready")
+    backend_name = os.environ.get("TTS_BACKEND", "megakernel").lower()
+
+    if backend_name == "v2":
+        from server.backend.tts_backend_v2 import QwenTTSBackendV2
+        _tts_backend = QwenTTSBackendV2()
+        logger.info("v2 custom-decode backend ready")
+    elif backend_name == "hf":
+        from server.backend.tts_backend_hf import QwenTTSBackendHF
+        _tts_backend = QwenTTSBackendHF()
+        logger.info("HF baseline backend ready")
+    else:
+        from server.backend.tts_backend_mk import QwenTTSBackendMK
+        _tts_backend = QwenTTSBackendMK()
+        logger.info("Megakernel backend ready")
 
 
 @asynccontextmanager
