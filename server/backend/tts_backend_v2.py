@@ -198,7 +198,9 @@ def _custom_decode_loop(
     top_k: int = 50,
     top_p: float = 1.0,
     chunk_size: int = CHUNK_FRAMES,
-    on_chunk=None,  # callback(codec_chunk: torch.Tensor [chunk, 16]) called per chunk
+    on_chunk=None,
+    talker_graph=None,      # TalkerGraph instance (CUDA graph path)
+    predictor_graph=None,   # PredictorGraph instance (CUDA graph path)
 ):
     """
     Custom autoregressive decode loop owning the full generation runtime.
@@ -278,6 +280,11 @@ def _custom_decode_loop(
     all_frames = []
     chunk_buffer = []
     step = 0
+    # prefill_len needed for TalkerGraph position tracking
+    if talker_graph is not None:
+        prefill_len = talker_graph.static_cache.get_seq_length()
+    else:
+        prefill_len = 0  # not used in eager path
 
     for step_idx in range(max_new_tokens):
         tok_val = token.item()   # CPU sync — needed to check EOS
@@ -290,7 +297,11 @@ def _custom_decode_loop(
         # --- Code predictor: CB1..CB15 ---
         last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))   # [1, 1, 1024]
         pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)         # [1, 2, 1024]
-        codebook_token_ids = _run_predictor(pred_input)                      # [15]
+
+        if predictor_graph is not None:
+            codebook_token_ids = predictor_graph.run(pred_input)             # [15] graph path
+        else:
+            codebook_token_ids = _run_predictor(pred_input)                  # [15] eager path
 
         # Full codec frame: CB0 + CB1..CB15
         all_cb = torch.cat([token.view(1), codebook_token_ids])   # [16]
@@ -298,13 +309,12 @@ def _custom_decode_loop(
         all_frames.append(all_cb.detach())
 
         # --- Build next-step input embedding ---
-        # Sum of 16 codec embeddings: CB0 from talker embed, CB1..15 from predictor embeds
-        codec_hiddens = [last_id_hidden]   # [1, 1, 1024]
+        codec_hiddens = [last_id_hidden]
         for i in range(num_code_groups - 1):
-            cb_tok = codebook_token_ids[i].unsqueeze(0).unsqueeze(0)   # [1, 1]
-            codec_hiddens.append(predictor_codec_embeds[i](cb_tok))    # [1, 1, 1024]
+            cb_tok = codebook_token_ids[i].unsqueeze(0).unsqueeze(0)
+            codec_hiddens.append(predictor_codec_embeds[i](cb_tok))
 
-        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)   # [1, 16, 1024] → [1, 1, 1024]
+        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)   # [1, 1, 1024]
 
         # Add text conditioning
         if gen_step < trailing_text_hiddens.shape[1]:
@@ -312,25 +322,25 @@ def _custom_decode_loop(
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
 
-        # --- Talker backbone forward (single decode step) ---
-        # Call talker.model (the Qwen3Model backbone) directly, bypassing talker.forward()
-        # so we control KV cache and embedding — no code predictor called inside
-        backbone_out = talker_model(
-            inputs_embeds=inputs_embeds,
-            past_key_values=past_key_values,
-            use_cache=True,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-
-        hidden = backbone_out.last_hidden_state    # [1, 1, 1024]
-        past_key_values = backbone_out.past_key_values
-
-        # Next token logits
-        logits = codec_head(hidden[:, -1, :])      # [1, 3072]
-
-        # Update recurrent state
-        past_hidden = hidden[:, -1:, :].clone()    # [1, 1, 1024]
+        # --- Talker backbone: single decode step ---
+        if talker_graph is not None:
+            # CUDA graph path: position = prefill_len + current step
+            hidden = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)   # [1, 1, 1024]
+            past_hidden = hidden[:, -1:, :].clone()
+            logits = codec_head(hidden[:, -1, :])
+        else:
+            # Eager path: DynamicCache grows each step
+            backbone_out = talker_model(
+                inputs_embeds=inputs_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            hidden = backbone_out.last_hidden_state
+            past_key_values = backbone_out.past_key_values
+            logits = codec_head(hidden[:, -1, :])
+            past_hidden = hidden[:, -1:, :].clone()
         gen_step += 1
         step = step_idx + 1
 
@@ -501,21 +511,48 @@ class QwenTTSBackendV2:
         self._speech_tokenizer = model.speech_tokenizer
 
         # torch.compile for kernel fusion — set V2_COMPILE=0 to disable
-        # torch.compile the talker backbone only.
-        # code_predictor uses MRoPE with shape (1,1,seq,16,128) which dynamo's
-        # fake-tensor tracer cannot reconcile with cos/sin (1,1,seq,128) — skip it.
-        if os.environ.get("V2_COMPILE", "1") != "0":
-            logger.info("[v2] Applying torch.compile to talker backbone only...")
-            try:
-                model.talker.model = torch.compile(
-                    model.talker.model, mode="default", fullgraph=False
-                )
-                logger.info("[v2] torch.compile applied to talker.model")
-            except Exception as e:
-                logger.warning(f"[v2] torch.compile failed ({e}), running uncompiled")
+        # CUDA graphs for talker and predictor — much faster than torch.compile
+        # for autoregressive decode. Set V2_CUDA_GRAPHS=0 to disable.
+        self._talker_graph = None
+        self._predictor_graph = None
+        if os.environ.get("V2_CUDA_GRAPHS", "1") != "0":
+            self._setup_cuda_graphs(model)
 
         logger.info(f"[v2] Ready in {(time.perf_counter()-t0)*1000:.0f}ms")
         logger.info(f"[v2] num_code_groups={self._config.num_code_groups}, vocab_size={self._config.vocab_size}")
+        if self._talker_graph:
+            logger.info("[v2] TalkerGraph + PredictorGraph CUDA graphs active")
+        else:
+            logger.info("[v2] Running uncompiled (set V2_CUDA_GRAPHS=1 to enable CUDA graphs)")
+
+    def _setup_cuda_graphs(self, model):
+        from server.backend.cuda_graphs import TalkerGraph, PredictorGraph
+        try:
+            talker = model.talker
+            pred_config = talker.code_predictor.config
+            talker_hidden = self._config.hidden_size  # 1024
+
+            self._predictor_graph = PredictorGraph(
+                code_predictor=talker.code_predictor,
+                pred_config=pred_config,
+                talker_hidden_size=talker_hidden,
+                do_sample=True,
+                temperature=0.9,
+                top_k=50,
+            )
+            self._predictor_graph.capture()
+
+            self._talker_graph = TalkerGraph(
+                talker_model=talker.model,
+                talker_config=self._config,
+                max_seq_len=512,
+            )
+            self._talker_graph.capture()
+
+        except Exception as e:
+            logger.warning(f"[v2] CUDA graph capture failed ({e}), falling back to eager")
+            self._talker_graph = None
+            self._predictor_graph = None
 
     def _run_custom_decode(self, text: str) -> tuple[list, float]:
         """
@@ -533,6 +570,9 @@ class QwenTTSBackendV2:
         t_prefill = time.perf_counter() - t0
         logger.info(f"[v2] Prefill done in {t_prefill*1000:.0f}ms, gen_step={gen_step}")
 
+        if self._talker_graph is not None:
+            self._talker_graph.prefill_kv(past_kv)
+
         frames = _custom_decode_loop(
             talker=self._talker,
             past_key_values=past_kv,
@@ -542,6 +582,8 @@ class QwenTTSBackendV2:
             tts_pad_embed=tts_pad,
             first_logits=first_logits,
             config=self._config,
+            talker_graph=self._talker_graph,
+            predictor_graph=self._predictor_graph,
         )
 
         t_decode = time.perf_counter() - t0
@@ -600,6 +642,10 @@ class QwenTTSBackendV2:
                             audio_queue.put(audio_bytes), loop
                         ).result()
 
+                # If TalkerGraph is active, copy DynamicCache → StaticCache
+                if self._talker_graph is not None:
+                    self._talker_graph.prefill_kv(past_kv)
+
                 frames = _custom_decode_loop(
                     talker=self._talker,
                     past_key_values=past_kv,
@@ -611,6 +657,8 @@ class QwenTTSBackendV2:
                     config=self._config,
                     chunk_size=CHUNK_FRAMES,
                     on_chunk=_on_chunk,
+                    talker_graph=self._talker_graph,
+                    predictor_graph=self._predictor_graph,
                 )
                 all_frames_ref.extend(frames)
 
