@@ -294,6 +294,17 @@ class _MKDecoder:
         self._v_cache.zero_()
         self._block_max_vals.fill_(float("-inf"))
         self._block_max_idxs.zero_()
+        # Zero all working buffers — stale values from previous calls cause garbage tokens
+        self._hidden.zero_()
+        self._activations.zero_()
+        self._residual.zero_()
+        self._q.zero_()
+        self._k.zero_()
+        self._v.zero_()
+        self._attn_out.zero_()
+        self._mlp_intermediate.zero_()
+        self._normalized.zero_()
+        self._output_token.zero_()
 
 
 # ---------------------------------------------------------------------------
