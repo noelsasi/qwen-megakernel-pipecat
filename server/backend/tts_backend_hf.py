@@ -63,8 +63,8 @@ class QwenTTSBackendHF:
         ids = self.processor(text, return_tensors="pt").input_ids.to(self.model.device)
         return dict(
             input_ids=[ids[0]],
-            languages=["English"],
-            speakers=["default"],
+            languages=["English"],   # may need to be "en" — verify from model config
+            speakers=[None],         # None = auto speaker
             max_new_tokens=4096,
             do_sample=True,
             temperature=0.9,

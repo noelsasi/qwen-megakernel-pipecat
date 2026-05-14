@@ -59,8 +59,8 @@ def run_inference(model, processor, text: str):
     input_ids = processor(text, return_tensors="pt").input_ids.to(model.device)
     # languages and speakers must be lists matching len(input_ids) — cannot be None
     batch_input_ids = [input_ids[0]]
-    languages = ["English"]
-    speakers = ["default"]
+    languages = ["English"]   # may need to be "en" — check if this errors
+    speakers = [None]         # None = no specific speaker (model auto-assigns)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
