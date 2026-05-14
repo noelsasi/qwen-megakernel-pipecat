@@ -250,8 +250,11 @@ class _MKDecoder:
             MAX_SEQ_LEN,
             self._attn_scale,
         )
+        result = int(self._output_token.item())
+        if self._position < 3:  # log first 2 steps only
+            print(f"[MK] step: in={token_id} pos={self._position} out={result} valid={0<=result<VOCAB_SIZE}")
         self._position += 1
-        return int(self._output_token.item())
+        return result
 
     def generate_n(self, first_token_id: int, num_steps: int) -> list[int]:
         """Run num_steps decode steps. Returns list of token ids."""
