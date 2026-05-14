@@ -403,92 +403,71 @@ class QwenTTSBackendMK:
         """
         decoder = self._decoder
         orig_forward = self._hf.model.talker.model.forward
-        lm_head_weight = decoder._lm_head_weight      # [3072, 1024]
-        final_norm_weight = decoder._final_norm_weight  # [1024]
-        _prefill_done = [False]
-        _step_count = [0]
-        _current_token = [0]  # tracks the token the megakernel should process next
+        orig_generate = self._hf.model.talker.generate
+        lm_head_weight = decoder._lm_head_weight
+        final_norm_weight = decoder._final_norm_weight
 
-        def _mk_forward(
-            input_ids=None,
-            inputs_embeds=None,
-            attention_mask=None,
-            past_key_values=None,
-            use_cache=True,
-            **kwargs,
-        ):
-            from types import SimpleNamespace
-
-            # Prefill: first call — run HF normally to populate KV cache
-            if not _prefill_done[0]:
-                out = orig_forward(
-                    input_ids=input_ids,
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    **kwargs,
-                )
-                pkv = out.past_key_values
-                decoder.reset()
-                prefill_len = decoder.load_kv_cache_from_hf(pkv)
-
-                # Compute first decode token from prefill last hidden state.
-                # talker.model (inner) returns last_hidden_state, not logits —
-                # the outer Qwen3TTSTalkerForConditionalGeneration applies codec_head.
-                # We replicate that: final_norm → lm_head → argmax.
-                last_h = out.last_hidden_state[0, -1].float()  # [HIDDEN_SIZE]
-                variance = last_h.pow(2).mean()
-                normed = (last_h * torch.rsqrt(variance + 1e-6)).to(torch.bfloat16)
-                normed = normed * final_norm_weight
-                logits_1d = lm_head_weight @ normed  # [3072]
-                first_token = int(logits_1d.argmax().item())
-                _current_token[0] = first_token
-                _prefill_done[0] = True
-                print(f"[MK] Prefill done — seq_len={prefill_len}, first_token={first_token}")
-                return out
-
-            # Decode step: run megakernel with the token we tracked from last step.
-            # Ignore inputs_embeds — HF constructed it but we don't need it.
-            current_token = _current_token[0]
-            next_token = decoder.step(current_token)
-            _step_count[0] += 1
-
-            if _step_count[0] <= 3:
-                print(f"[MK] step {_step_count[0]}: {current_token} -> {next_token}")
-
-            # If EOS, signal it via logits so HF stops
-            if next_token == EOS_TOKEN_ID or _step_count[0] >= 500:
-                print(f"[MK] EOS at step {_step_count[0]}, token={next_token}")
-                next_token = EOS_TOKEN_ID
-
-            _current_token[0] = next_token
-
-            logits = torch.zeros(1, 1, VOCAB_SIZE, dtype=torch.bfloat16, device="cuda")
-            logits[0, 0, next_token] = 1.0
-
-            last_hidden = decoder._hidden.detach().clone().view(1, 1, HIDDEN_SIZE)
-
-            return SimpleNamespace(
-                logits=logits,
-                past_key_values=None,
-                hidden_states=(last_hidden,),
-                last_hidden_state=last_hidden,
-                attentions=None,
+        def _mk_generate(**kwargs):
+            """
+            Replace talker.generate() entirely.
+            1. Run prefill via one orig_forward call.
+            2. Run our own tight decode loop (no HF Python overhead per step).
+            3. Return token tensor — HF passes it to code_predictor + vocoder.
+            """
+            inputs_embeds = kwargs.get("inputs_embeds")
+            # Step 1: prefill
+            prefill_out = orig_forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=kwargs.get("attention_mask"),
+                use_cache=True,
             )
+            pkv = prefill_out.past_key_values
+            decoder.reset()
+            prefill_len = decoder.load_kv_cache_from_hf(pkv)
 
-        self._hf.model.talker.model.forward = _mk_forward
+            # First token from prefill hidden state
+            last_h = prefill_out.last_hidden_state[0, -1].float()
+            variance = last_h.pow(2).mean()
+            normed = (last_h * torch.rsqrt(variance + 1e-6)).to(torch.bfloat16)
+            normed = normed * final_norm_weight
+            first_token = int((lm_head_weight @ normed).argmax().item())
+            print(f"[MK] Prefill done — seq_len={prefill_len}, first_token={first_token}")
+
+            # Step 2: tight decode loop — no HF overhead
+            max_steps = kwargs.get("max_new_tokens", 4096)
+            tokens = []
+            current = first_token
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                for _ in range(max_steps):
+                    next_tok = decoder.step(current)
+                    if next_tok == EOS_TOKEN_ID:
+                        break
+                    tokens.append(next_tok)
+                    current = next_tok
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+            n = len(tokens)
+            print(f"[MK] Decode complete — {n} tokens in {elapsed*1000:.0f}ms ({n/elapsed:.0f} tok/s)")
+
+            # Return as HF expects: GenerateOutput with sequences [1, N]
+            # HF uses .sequences from the generate output
+            from types import SimpleNamespace
+            token_tensor = torch.tensor(tokens, dtype=torch.long, device="cuda").unsqueeze(0)
+            return SimpleNamespace(sequences=token_tensor)
+
+        self._hf.model.talker.generate = _mk_generate
         try:
             with torch.inference_mode():
                 wavs, sr = self._hf.generate_custom_voice(
                     text=text,
                     language=self._language,
                     speaker=self._speaker,
-                    max_new_tokens=500,
+                    max_new_tokens=4096,
                     do_sample=False,
                 )
-            print(f"[MK] Decode complete — {_step_count[0]} megakernel steps")
         finally:
+            self._hf.model.talker.generate = orig_generate
             self._hf.model.talker.model.forward = orig_forward
 
         audio = np.array(wavs[0], dtype=np.float32).squeeze()
