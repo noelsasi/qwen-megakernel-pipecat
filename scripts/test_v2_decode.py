@@ -168,20 +168,22 @@ def stage3_eos(backend):
     audio_dur = n_frames / 12   # seconds (12Hz codec)
     elapsed = t1 - t0
     cb0_tokens = [int(f[0]) for f in frames]
-    eos_hit = EOS_TOKEN_ID in cb0_tokens
+    # EOS fires by breaking BEFORE appending the EOS frame, so it won't appear
+    # in cb0_tokens. Instead check if we stopped before the cap.
+    stopped_before_cap = n_frames < MAX_FRAMES
+    eos_likely = stopped_before_cap  # stopped early = EOS fired
 
     logger.info(f"Decode: {n_frames} frames in {elapsed*1000:.0f}ms")
     logger.info(f"  Audio duration: {audio_dur:.2f}s")
     logger.info(f"  tok/s (codec frames/s): {n_frames / elapsed:.1f}")
-    logger.info(f"  EOS hit: {eos_hit}")
+    logger.info(f"  Stopped before cap ({MAX_FRAMES}): {stopped_before_cap} → EOS likely fired: {eos_likely}")
     logger.info(f"  First 10 CB0 tokens: {cb0_tokens[:10]}")
     logger.info(f"  Last 10 CB0 tokens: {cb0_tokens[-10:]}")
-    # Check token distribution
     unique_tokens = set(cb0_tokens)
-    logger.info(f"  Unique CB0 tokens: {len(unique_tokens)} (healthy: > 20, stuck: <= 3)")
-    if not eos_hit:
-        logger.warning(f"  EOS NOT hit after {MAX_FRAMES} frames — check token distribution above")
-    logger.info("STAGE 3 PASS" if eos_hit else f"STAGE 3 PARTIAL — {n_frames} frames, no EOS (capped at {MAX_FRAMES})")
+    logger.info(f"  Unique CB0 tokens: {len(unique_tokens)}")
+    if not eos_likely:
+        logger.warning(f"  EOS did NOT fire — ran full {MAX_FRAMES} frames")
+    logger.info("STAGE 3 PASS" if eos_likely else f"STAGE 3 PARTIAL — no EOS after {MAX_FRAMES} frames")
     return frames
 
 

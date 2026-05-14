@@ -44,6 +44,11 @@ SAMPLE_RATE = 24000
 CHUNK_FRAMES = 12      # yield audio every 12 codec frames = 960ms of audio
 CONTEXT_FRAMES = 25    # left-context window for causal codec decoder
 SAMPLES_PER_FRAME = SAMPLE_RATE // 12   # = 2000 samples = 80ms per codec frame
+# codec_eos_token_id from the actual model's config.json (Qwen3-TTS-12Hz-0.6B-CustomVoice):
+#   talker_config.codec_eos_token_id = 2150
+# The Python class default is 4198 but the shipped checkpoint overrides it to 2150.
+# 2150 is within [0, 3072) so it's a valid logit index.
+# Confirmed from: QwenLM/Qwen3-TTS modeling + faster-qwen3-tts which reads it from config.
 EOS_TOKEN_ID = 2150
 MAX_NEW_TOKENS = 4096
 MIN_NEW_TOKENS = 2
@@ -212,20 +217,20 @@ def _custom_decode_loop(
     eos_id = EOS_TOKEN_ID
     vocab_size = config.vocab_size   # 3072
 
-    # Suppress artifact tokens in the top range, EOS=2150 must remain reachable.
-    # vocab_size=3072, suppress_start=2048. EOS=2150 is inside [2048, 3072).
-    # Strategy: suppress [2048:2150] and [2151:3072], leave 2150 (EOS) alone.
+    # suppress_tokens matches official modeling_qwen3_tts.py lines ~1702-1706:
+    #   [i for i in range(vocab_size - 1024, vocab_size) if i != codec_eos_token_id]
+    # = all of [2048..3071] except 2150 (EOS).
+    # This is applied per-step. EOS is additionally suppressed for min_new_tokens steps.
     suppress_start = max(0, vocab_size - 1024)   # = 2048
-    assert eos_id > suppress_start, f"EOS {eos_id} must be > suppress_start {suppress_start}"
 
     def _sample(logits_1d: torch.Tensor, suppress_eos: bool) -> torch.Tensor:
         """Sample from [vocab_size] logits. Returns scalar int64 tensor."""
         logits_1d = logits_1d.clone()
-        # Suppress high-artifact range, carving out EOS slot
+        # Suppress [2048..3071] except EOS slot at 2150
         logits_1d[suppress_start:eos_id] = float("-inf")   # [2048..2149]
         logits_1d[eos_id + 1:] = float("-inf")             # [2151..3071]
         if suppress_eos:
-            logits_1d[eos_id] = float("-inf")
+            logits_1d[eos_id] = float("-inf")              # suppress EOS for warmup steps
 
         if do_sample and temperature > 0:
             logits_1d = logits_1d / temperature
@@ -249,37 +254,63 @@ def _custom_decode_loop(
     # the model handle causal masking automatically
 
     for step_idx in range(max_new_tokens):
-        if token.item() == eos_id:
-            logger.debug(f"[v2] EOS at step {step_idx}")
+        tok_val = token.item()
+        if tok_val == eos_id:
+            logger.info(f"[v2] EOS fired at step {step_idx} (token={tok_val})")
             break
+        if step_idx < 3:
+            logger.info(f"[v2] step {step_idx}: token={tok_val}")
 
-        # --- Code predictor: produce CB1..CB15 ---
+        # --- Code predictor: produce CB1..CB15 via manual forward loop ---
+        # Avoids HF generate() overhead (tokenizer, sampling machinery, Python dispatch).
+        # Mirrors PredictorGraph.run() in faster-qwen3-tts.
         last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))   # [1, 1, 1024]
         pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)         # [1, 2, 1024]
 
-        # code_predictor.generate() runs 15 autoregressive steps internally.
-        # inputs_embeds has seq_len=2 (past_hidden + last_id_hidden), so HF
-        # generate() returns sequences of shape [1, 2 + 15] = [1, 17].
-        # The first 2 positions are not real token IDs (inputs_embeds had no
-        # corresponding input_ids). We want only the 15 newly generated tokens.
-        predictor_result = predictor.generate(
+        pred_model = predictor.model          # backbone (5-layer transformer)
+        pred_lm_heads = predictor.lm_head     # ModuleList of 15 Linear heads
+        pred_embeds = predictor.get_input_embeddings()  # ModuleList of 15 Embeddings
+
+        codebook_token_ids = []
+        pred_past_kv = None
+        # Step 0: prefill the predictor with [past_hidden, last_id_hidden]
+        pred_out = pred_model(
             inputs_embeds=pred_input,
-            max_new_tokens=num_code_groups - 1,
-            do_sample=do_sample,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            output_hidden_states=False,
-            return_dict_in_generate=True,
+            past_key_values=pred_past_kv,
+            use_cache=True,
+            return_dict=True,
         )
-        # sequences shape: [1, total_len]. With inputs_embeds HF may or may not
-        # include a prefix — take the last (num_code_groups-1) tokens which are
-        # always the generated CB1..CB15 regardless of prefix length.
-        seq = predictor_result.sequences[0]              # [total_len]
-        n_generated = num_code_groups - 1               # 15
-        codebook_token_ids = seq[-n_generated:]         # [15] — CB1..CB15
+        pred_hidden = pred_out.last_hidden_state   # [1, 2, pred_hidden]
+        pred_past_kv = pred_out.past_key_values
+        # Sample CB1 from last position of prefill
+        cb_logits = pred_lm_heads[0](pred_hidden[:, -1, :])   # [1, pred_vocab]
+        if do_sample and temperature > 0:
+            cb_tok = torch.multinomial(torch.softmax(cb_logits / temperature, -1), 1).squeeze()
+        else:
+            cb_tok = cb_logits.argmax(-1).squeeze()
+        codebook_token_ids.append(cb_tok)
+
+        # Steps 1-14: each uses the previous CB token's embedding as input
+        for cb_idx in range(1, num_code_groups - 1):
+            cb_emb = pred_embeds[cb_idx - 1](cb_tok.unsqueeze(0).unsqueeze(0))  # [1, 1, pred_hidden]
+            pred_out = pred_model(
+                inputs_embeds=cb_emb,
+                past_key_values=pred_past_kv,
+                use_cache=True,
+                return_dict=True,
+            )
+            pred_hidden = pred_out.last_hidden_state
+            pred_past_kv = pred_out.past_key_values
+            cb_logits = pred_lm_heads[cb_idx](pred_hidden[:, -1, :])
+            if do_sample and temperature > 0:
+                cb_tok = torch.multinomial(torch.softmax(cb_logits / temperature, -1), 1).squeeze()
+            else:
+                cb_tok = cb_logits.argmax(-1).squeeze()
+            codebook_token_ids.append(cb_tok)
+
+        codebook_token_ids = torch.stack(codebook_token_ids)  # [15]
         if step_idx == 0:
-            logger.debug(f"[v2] predictor seq len={len(seq)}, taking last {n_generated}: {codebook_token_ids.tolist()}")
+            logger.info(f"[v2] predictor manual loop: {codebook_token_ids.tolist()}")
 
         # Full codec frame: CB0 + CB1..CB15
         all_cb = torch.cat([token.view(1), codebook_token_ids])   # [16]
