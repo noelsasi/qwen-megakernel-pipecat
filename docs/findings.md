@@ -1,7 +1,7 @@
 # Findings & Observations
 
 > Ground truth only — confirmed by running actual code.
-> Last updated: 2026-05-14 (Session 3)
+> Last updated: 2026-05-14 (Session 4)
 
 ---
 
@@ -187,48 +187,65 @@ each project to the intermediate dimension (3072), not HIDDEN_SIZE.
 | HEAD_DIM | 128 | 128 | ✅ |
 | INTERMEDIATE_SIZE | 3072 | 3072 | ✅ |
 | LDG_VOCAB_SIZE | ~~151936~~ → **3072** | 3072 | ✅ patched |
-| rope_theta | 10000 | 1,000,000 | ❌ Python-side fix |
-| RoPE type | standard | interleaved MRope | ❌ Python-side fix |
-| MAX_SEQ_LEN | 2048 | 32768 | ❌ Python constant only |
+| rope_theta | 10000 → **1,000,000** | 1,000,000 | ✅ fixed Python-side |
+| RoPE type | ~~MRope~~ → **standard 1D** | standard 1D | ✅ fixed Python-side |
+| MAX_SEQ_LEN | 2048 → **32768** | 32768 | ✅ fixed Python-side |
 
-**All kernel.cu mismatches are now fixed.** Remaining fixes are Python-only (cos/sin table builder).
+### RoPE — confirmed standard 1D (Session 4)
 
-### Single decode step — confirmed working (Session 1)
+**Was wrong in Sessions 1-3:** We assumed the talker uses interleaved MRope (`mrope_section=[24,20,20]`) based on the model config. This was incorrect.
 
+**Confirmed from attention layer spy:** `position_ids` shape is `[1, seq_len]` — standard sequential `[0,1,...,N-1]`. NOT `[3, 1, seq_len]`. The talker uses `Qwen3TTSTalkerRotaryEmbedding` with standard 1D RoPE.
+
+**Fix:** Replaced `_build_mrope_tables()` with `_build_rope_tables()`. `inv_freq` is copied directly from `model.rotary_emb.inv_freq` to guarantee bit-for-bit match with HF prefill.
+
+### DynamicCache API — confirmed (Session 4)
+
+This version of transformers uses a different DynamicCache API than documented:
+
+```python
+# WRONG (older transformers):
+pkv.key_cache[i]    # AttributeError
+pkv.value_cache[i]  # AttributeError
+
+# CORRECT (installed version):
+pkv.layers[i].keys    # [1, NUM_KV_HEADS, seq_len, HEAD_DIM]
+pkv.layers[i].values  # [1, NUM_KV_HEADS, seq_len, HEAD_DIM]
+len(pkv.layers)       # 28
 ```
-step(0) → token 112  ✅
+
+### talker.generate() call signature — confirmed (Session 4)
+
+```python
+# generate() receives:
+inputs_embeds=[1, 13, 1024]  # NOT input_ids — always embeddings
+past_key_values=None          # no KV cache passed in
+# + trailing_text_hidden, tts_pad_embed, and other custom kwargs
 ```
 
-This used isolated buffers with zero weights. The full `_MKDecoder` path with real
-weights has not yet been run. See `scripts/test_mk_decode.py` stage 2 + 3.
+Every decode step also uses `inputs_embeds=[1,1,1024]` — never `input_ids`. HF does codec_embedding lookup internally before calling `talker.model.forward()`. The embedding at decode steps is a blend (not a pure codec lookup) — cosine similarity to any single codec token ≈ 0.48 max.
 
-### Integration approach (Session 2 — monkey-patch)
+### Integration approach — current (Session 4)
 
-Original blockers from Session 1 were resolved by NOT trying to split the model:
+Patch `talker.model.forward()`:
+1. **Prefill** (first call): run HF normally → capture `DynamicCache` via `.layers[i].keys/values` → transfer to megakernel k/v cache buffers → compute first decode token from `last_hidden_state[-1]` via manual RMSNorm + `lm_head_weight` argmax
+2. **Decode steps**: ignore `inputs_embeds` entirely → feed internally-tracked token to megakernel `step()` → return `SimpleNamespace(logits, past_key_values=None, hidden_states, last_hidden_state, attentions=None)` → HF embeds the one-hot argmax token for next step (we ignore it)
 
-1. ~~**Prefill uses `inputs_embeds`**~~ — Resolved: let HF run prefill normally. We only intercept `talker.model.generate()`, which is called after prefill with a `DynamicCache` already populated.
+### Current blocker — KV cache RoPE compatibility (Session 4)
 
-2. ~~**Vocoder has no public API**~~ — Resolved: the monkey-patched `generate()` returns a complete `[1, N]` token tensor to HF. HF then runs `code_predictor` + vocoder as normal. We never need to call the vocoder ourselves.
+**Isolated test:** `decode(1995, pos=0)` with zero KV cache → token **842** ✅ (valid)  
+**Real test:** `decode(1995, pos=18)` with HF prefill KV cache → **garbage** ❌
 
-**Current approach:** patch `talker.model.generate` at call time, copy KV cache from HF `DynamicCache` into megakernel buffers, run decode loop, return token tensor. HF continues from there unchanged.
+HF stores keys post-RoPE in the DynamicCache. The megakernel also stores its own keys post-RoPE (it applies RoPE itself during the decode step). When we copy HF's post-RoPE keys into the megakernel cache, and the kernel then attends over them using its own cos/sin tables — if the RoPE applied by HF and the tables in the kernel are not exactly identical (same inv_freq, same rotation format), the attention scores will be wrong.
 
-**Status:** coded, not yet run end-to-end on GPU. Run `scripts/test_mk_decode.py` to verify.
+We fixed the cos/sin tables to use HF's exact inv_freq. The kernel is still producing garbage. Next investigation: confirm whether HF stores keys pre-RoPE or post-RoPE, and whether the rotation format (interleaved vs non-interleaved complex rotation) matches the kernel.
 
-### KV cache layout (confirmed)
-
-HF `DynamicCache`: list of 28 × `(k[1, 8, seq, 128], v[1, 8, seq, 128])`  
-Megakernel: `[28, 8, MAX_SEQ_LEN, 128]` pre-allocated  
-→ Layouts are compatible. A KV cache transfer is straightforward IF the vocoder blocker is resolved.
-
----
-
-## MRope Table Builder
-
-Implemented in `server/backend/tts_backend_mk.py: _build_mrope_tables()`.
-
-- Interleaved layout: T₀H₀A₀T₁H₁A₁... (round-robin across 3 position streams)
-- During TTS autoregressive decode all 3 streams share the same step index
-- Output: `[MAX_SEQ_LEN, HEAD_DIM]` bfloat16, compatible with kernel indexing
+```bash
+# Next diagnostic to run:
+grep -n "k_cache\|past_key\|rotary\|apply_rot" \
+  .venv/lib/python3.14/site-packages/qwen_tts/core/models/modeling_qwen3_tts.py \
+  | grep "1[0-9][0-9][0-9]:" | head -30
+```
 
 ---
 

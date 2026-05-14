@@ -19,18 +19,32 @@ Performance targets from the brief:
 
 ---
 
-## Honest Risk Register (Read Before Starting)
+## Status (as of Session 4 — 2026-05-14)
+
+| Phase | Status |
+|-------|--------|
+| A — Baseline HF inference | ✅ Done — RTF 0.879, WAV confirmed |
+| B — Streaming | ⚠️ Fake streaming only — buffers full audio |
+| C — Pipecat pipeline | ⚠️ Written, never run on server |
+| D — Megakernel integration | 🔴 Prefill fires, decode produces garbage at pos>0 |
+
+**Current blocker:** KV cache RoPE format mismatch between HF prefill and megakernel decode.
+See `docs/findings.md` → "Current blocker" section for next diagnostic to run.
+
+---
+
+## Honest Risk Register
 
 | Risk | Severity | Status |
 |------|----------|--------|
-| Qwen3-TTS Python package API is unverified | HIGH | Must verify in Phase A |
-| Internal talker module path is unknown | HIGH | Must inspect in Phase A |
-| Streaming/incremental audio decode may not be supported | HIGH | Must verify in Phase B |
-| Megakernel constant compatibility is unverified | HIGH | Must diff in Phase D |
-| RTX 5090 (sm_120) required — no fallback | HIGH | Vast.ai required |
-| TTFC < 60ms may be unreachable with full model load overhead | MEDIUM | Must measure |
-| Code predictor integration with megakernel is complex | MEDIUM | Scoped to Phase D |
-| Pipecat version and TTSService API may differ from docs | LOW | Pin version, read source |
+| Qwen3-TTS Python package API is unverified | HIGH | ✅ Resolved — `qwen-tts` pip package, `Qwen3TTSModel` |
+| Internal talker module path is unknown | HIGH | ✅ Resolved — `model.talker`, `model.talker.model` |
+| Streaming/incremental audio decode may not be supported | HIGH | ⚠️ Confirmed unsupported natively — fake streaming implemented |
+| Megakernel constant compatibility is unverified | HIGH | ✅ All constants match after LDG_VOCAB_SIZE patch |
+| RTX 5090 (sm_120) required — no fallback | HIGH | ✅ Running on Vast.ai RTX 5090 |
+| TTFC < 60ms may be unreachable with full model load overhead | MEDIUM | ⏳ Not yet measured with working megakernel |
+| KV cache RoPE format compatibility | HIGH | 🔴 **Active blocker** — HF post-RoPE keys may not match kernel format |
+| Pipecat version and TTSService API may differ from docs | LOW | ✅ Resolved — pipecat 1.1.0 API confirmed |
 
 ---
 

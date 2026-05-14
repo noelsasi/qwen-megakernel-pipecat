@@ -106,12 +106,43 @@ The patch is thread-safe per-call (install → run → restore in try/finally).
 
 4. **No demo recording** — Required deliverable. Needs the pipeline running end-to-end first.
 
-### Next session: immediate priorities (in order)
+---
 
-1. `git pull && python scripts/test_mk_decode.py` — confirm decode op signature, single step, end-to-end
-2. If stage 2 fails with arg error: paste the schema line + error, fix arg order
-3. If stage 3 fails with `AttributeError` on `DynamicCache`: paste traceback, fix KV cache extraction
-4. Once `test_mk_decode.py` passes: `uvicorn server.pipeline.voice_agent:app` — check for import errors
-5. Connect React client, confirm STT→LLM→TTS→audio round-trip works
-6. `python scripts/benchmark.py --backend both --trials 5` — get real numbers
-7. Record demo, fill README table
+## 2026-05-14 — Session 4
+
+### Summary
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase D — Megakernel decode firing | ✅ Prefill works | KV cache transfers, first token extracted correctly |
+| Phase D — Full decode loop | ❌ Blocked | Garbage tokens at pos>0 — KV RoPE compatibility issue |
+| Phase C — Pipecat pipeline | ⏳ Not started | Blocked on Phase D |
+
+### What was discovered and fixed
+
+| Finding | Impact |
+|---------|--------|
+| `talker.generate()` receives `inputs_embeds`, no `past_key_values` | Needed to patch `talker.model.forward()` instead |
+| All forward calls use `inputs_embeds`, never `input_ids` | Can't recover token from embedding (cosine sim ~0.48) |
+| `DynamicCache` uses `.layers[i].keys/.values` API | Previous `.key_cache/.value_cache` was silently wrong |
+| Talker uses **standard 1D RoPE**, NOT interleaved MRope | MRope tables replaced with standard RoPE matching HF inv_freq |
+| `BaseModelOutputWithPast` has no `.logits` | First token computed via manual RMSNorm + lm_head argmax on last_hidden_state |
+| HF generate loop accesses `.attentions` on forward output | Added `attentions=None` to SimpleNamespace |
+
+### Current blocker — KV cache RoPE format
+
+**Symptom:** `decode(token, pos=0)` → valid token ✅. `decode(token, pos=18)` with real HF prefill KV cache → garbage token ❌
+
+**Root cause hypothesis:** HF stores keys post-RoPE in DynamicCache. The megakernel also expects to attend over post-RoPE keys — but the rotation format may differ. Specifically: HF's `apply_rotary_pos_emb` uses the standard complex rotation `(x1*cos - x2*sin, x1*sin + x2*cos)`, while the kernel may use a different layout (interleaved pairs vs split half).
+
+**Next step:** Check whether HF stores pre-RoPE or post-RoPE keys, and confirm the rotation format matches the kernel's attention code.
+
+```bash
+grep -n "k_cache\|past_key\|rotary\|apply_rot" \
+  .venv/lib/python3.14/site-packages/qwen_tts/core/models/modeling_qwen3_tts.py \
+  | grep "1[0-9][0-9][0-9]:" | head -30
+```
+
+### All commits squashed
+
+All session 3+4 fix commits were squashed into one clean commit (`272afde` + `9f1b320`) before pushing. Git history is clean.
