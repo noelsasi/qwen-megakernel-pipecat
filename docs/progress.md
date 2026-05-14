@@ -181,6 +181,65 @@ All scratch buffers except `hidden_buffer` are cast to `float*` inside the kerne
 
 ---
 
+## 2026-05-14 — Session 7 (Phase 2 — Custom Decode Loop + CUDA Graphs)
+
+### Summary
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 2 — Custom decode loop | ✅ Working | EOS fires, valid codec frames, real streaming |
+| Phase 2 — CUDA graphs | ✅ Captured | TalkerGraph + PredictorGraph via StaticCache |
+| Phase 2 — Pipecat integration | ✅ Working | TTS_BACKEND=v2 wired in voice_agent.py |
+| Phase 3 — Megakernel in v2 | ⏳ Next | Replace TalkerGraph decode with megakernel step |
+| Demo recording | ⏳ Pending | Audio confirmed playing, need screen capture |
+
+### Architecture reset: why Phase 1 failed and Phase 2 approach
+
+**Root cause of Phase 1 failure:** Monkey-patching `talker.generate()` only tracked integer token IDs. Qwen3-TTS generation requires per-step: code predictor (15 steps → 16-codebook frame), summed codec embeddings, and `trailing_text_hiddens` text conditioning. Skipping all of this meant EOS (token 2150) never appeared in the logit output.
+
+**Phase 2 approach:** Own the full decode runtime. Intercept `talker.generate()` only to capture prefill tensors, then run our own loop calling code_predictor and talker backbone directly.
+
+**Key source references used:**
+- `QwenLM/Qwen3-TTS modeling_qwen3_tts.py` — exact tensor shapes and per-step flow
+- `andimarafioti/faster-qwen3-tts streaming.py` — reference decode loop implementation
+- `andimarafioti/faster-qwen3-tts talker_graph.py` — CUDA graph + StaticCache pattern
+
+### Performance milestones this session
+
+| Milestone | RTF | TTFC | Notes |
+|-----------|-----|------|-------|
+| v2 eager, HF generate for predictor | 0.906 | 924 ms | EOS hit, real streaming, first working end-to-end |
+| v2 + manual predictor loop | 0.835 | 842 ms | Replaced predictor.generate() with direct forward() calls |
+| v2 + CUDA graphs (TalkerGraph + PredictorGraph) | **0.237** | **93 ms** | StaticCache + CUDA graph capture |
+
+### Key bugs found and fixed
+
+| Bug | Fix |
+|-----|-----|
+| EOS token ID was 2150 (in logit range) but suppress mask wiped it | Suppress `[2048:2150]` and `[2151:3072]` separately, leave 2150 open |
+| `predictor.generate()` with `inputs_embeds` returns sequences without prefix | Take `sequences[0]` directly (not `seq[input_len:]`) |
+| `talker.forward()` intercept not working | Intercept `talker.generate()` instead — what `generate_custom_voice()` actually calls |
+| `torch.compile(mode="reduce-overhead")` → CUDA graph error on dynamic KV | Use StaticCache + explicit CUDA graph capture instead |
+| `StaticCache.reset()` fails outside inference_mode | Decorate `prefill_kv()` and `run()` with `@torch.inference_mode()` |
+
+### Per-step timing breakdown (post CUDA graphs)
+
+| Component | Eager | CUDA graph |
+|-----------|-------|------------|
+| Code predictor (15 steps) | 49 ms | ~2-3 ms |
+| Talker backbone (28L, 1 step) | 20 ms | ~2-5 ms |
+| Python loop overhead | — | ~5-8 ms |
+| **Total per frame** | **~69 ms** | **~13 ms** |
+
+### Remaining gap to targets
+
+RTF 0.237 vs 0.15 target — 1.58× remaining. Three paths:
+1. Megakernel for talker (~1ms/step vs current ~2-5ms)
+2. Async vocoder (don't block decode thread on vocoder call)
+3. Python loop vectorization (batch embedding ops)
+
+---
+
 ## 2026-05-14 — Session 6 (Final)
 
 ### Summary
