@@ -15,7 +15,7 @@
 | No separate processor | Tokenization is internal to `Qwen3TTSModel` | Confirmed from source |
 | `model_type` in config | `qwen3_tts` | `config.json` |
 | HF model ID | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Model card |
-| **Sample rate** | **12000 Hz** (not 24000) | 12Hz tokenizer, returned by model |
+| **Sample rate** | **24000 Hz** | Confirmed from baseline output — model card "12Hz" refers to codec frame rate, not audio sample rate |
 
 ---
 
@@ -153,10 +153,28 @@ Source: `qwen_megakernel/csrc/kernel.cu` (expected defaults) vs confirmed model 
 
 ---
 
+## Baseline Performance (Phase A.4 — RTX 5090, no megakernel)
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Model load time | ~5800 ms | Cold load, bfloat16 |
+| Generation time | 8582 ± 853 ms | 5 trials, ~9.7s audio |
+| Audio duration | ~9760 ms | Default test sentence |
+| Sample rate | 24000 Hz | Confirmed — "12Hz" = codec frame rate |
+| **RTF** | **0.879** | Near real-time, NOT faster than real-time |
+| Target RTF < 0.15 | **FAIL** | Needs ~6× speedup from megakernel |
+| EOS token ID | **2150** | From pad_token_id warning |
+| flash-attn | NOT installed | Expected to give meaningful speedup |
+
+**The 6× speedup gap is what the megakernel must close.** RTF 0.879 → 0.15 is a 5.9× improvement needed.
+
+---
+
 ## Open Questions
 
-1. **Streaming return type** — what does `generate(non_streaming_mode=False)` actually return? Generator? Blocking with list? (Answer pending Phase A.4)
-2. **EOS token ID** — what value signals end of codec generation? (check `generation_config.json` or model source)
-3. **Vocoder path** — where is the DAC/vocoder in the module tree? Not visible in lm_head output — may be inside code_predictor or a separate module.
-4. **MRope in megakernel** — does `kernel.cu` have any MRope code, or is it purely standard RoPE? (Answer pending Phase D.1 clone + grep)
-5. **Weight key names** — what keys does `qwen_megakernel/model.py` expect? Must match against `model.talker.state_dict()` keys.
+1. **EOS token** — confirmed as 2150 from `pad_token_id` warning ✅
+2. **Sample rate** — confirmed 24000 Hz ✅ ("12Hz" in model name = codec frame rate)
+3. **Streaming internals** — `generate_custom_voice()` is blocking; need to hook internal `generate()` to get per-chunk audio for real TTFC measurement (Phase B)
+4. **MRope in megakernel** — does `kernel.cu` have any MRope code, or is it purely standard RoPE? (Phase D.1)
+5. **Weight key names** — what keys does `qwen_megakernel/model.py` expect vs `model.model.state_dict()` keys? (Phase D.2)
+6. **flash-attn impact** — how much does installing flash-attn improve RTF on RTX 5090? Worth measuring before megakernel.

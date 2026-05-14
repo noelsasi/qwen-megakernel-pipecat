@@ -34,11 +34,30 @@
 
 ---
 
+### Phase A.4 — Baseline Inference ✅
+
+- `generate_custom_voice()` works correctly with speaker="Ryan", language="English"
+- WAV saved: `output_baseline.wav`, sr=24000 Hz (model returns 24000, not 12000 as assumed)
+- EOS token confirmed: 2150 (from pad_token_id warning)
+
+**Baseline numbers (RTX 5090, bfloat16, no flash-attn, no megakernel):**
+
+| Metric | Value |
+|--------|-------|
+| Generation time | 8582 ± 853 ms |
+| Audio duration | ~9760 ms |
+| Sample rate | 24000 Hz |
+| **RTF** | **0.879** |
+| Target RTF < 0.15 | **FAIL** (5.9× too slow) |
+
+RTF 0.879 means the model generates audio almost in real-time but NOT faster — this is the baseline we need to beat with the megakernel. The target (RTF < 0.15) requires ~6× speedup.
+
+---
+
 ## Pending
 
-- [ ] **Phase A.4** — Run `phase_a_baseline.py`, get WAV output + RTF measurement
-- [ ] **Phase B** — Probe streaming: does `non_streaming_mode=False` yield chunks or full audio?
+- [ ] **Phase B** — Real streaming: hook `generate()` internals to yield audio chunks before full generation completes (reduces TTFC)
 - [ ] **Phase C** — Pipecat pipeline end-to-end (STT → LLM → TTS → speaker)
 - [ ] **Phase D** — Megakernel: clone repo, run compat check, resolve MRope risk
-- [ ] flash-attn install (optional performance improvement for baseline)
+- [ ] flash-attn install — likely gives meaningful speedup on RTX 5090
 - [ ] HF_TOKEN set on server (currently unauthenticated — hitting rate limits)
