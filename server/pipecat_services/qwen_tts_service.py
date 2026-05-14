@@ -1,14 +1,11 @@
 """
-Phase C — Pipecat TTSService adapter for Qwen3-TTS.
+Pipecat 1.1.0 TTSService adapter for Qwen3-TTS (and LocalDevTTSBackend).
 
-Wraps QwenTTSBackendHF (or MK) as a Pipecat TTSService subclass.
-Emits `tts-metrics` custom frames after each utterance so the React
-dashboard can display TTFC, RTF, tok/s, and E2E latency live.
-
-NOTE: The exact TTSService API varies by pipecat-ai version. If you get
-AttributeError or signature mismatches, run:
-    python -c "import pipecat.services.tts_service as m; print(m.__file__)"
-and read that file to find the correct base class API.
+Verified API (pipecat-ai 1.1.0):
+  - run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]
+  - TTSStartedFrame(context_id=...)
+  - TTSAudioRawFrame(audio, sample_rate, num_channels, context_id=...)
+  - TTSStoppedFrame(context_id=...)
 """
 
 import time
@@ -16,29 +13,20 @@ from collections.abc import AsyncGenerator
 
 import numpy as np
 
-try:
-    from pipecat.services.tts_service import TTSService
-    from pipecat.frames.frames import (
-        Frame,
-        TTSAudioRawFrame,
-        TTSStartedFrame,
-        TTSStoppedFrame,
-        ErrorFrame,
-    )
-except ImportError as e:
-    raise ImportError(
-        f"pipecat-ai not installed or wrong version: {e}\n"
-        "Install with: pip install pipecat-ai[silero]"
-    ) from e
+from pipecat.services.tts_service import TTSService
+from pipecat.frames.frames import (
+    Frame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+    ErrorFrame,
+)
 
 
 class QwenTTSService(TTSService):
     """
-    Pipecat TTSService backed by Qwen3-TTS.
-
-    Args:
-        backend: QwenTTSBackendHF or QwenTTSBackendMK instance (pre-loaded)
-        sample_rate: audio sample rate in Hz (default 24000)
+    Pipecat TTSService adapter.
+    Works with QwenTTSBackendHF, QwenTTSBackendMK, or LocalDevTTSBackend.
     """
 
     def __init__(self, backend, sample_rate: int = 24000, **kwargs):
@@ -46,20 +34,13 @@ class QwenTTSService(TTSService):
         self.backend = backend
         self._sample_rate = sample_rate
 
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame | None, None]:
-        """
-        Called by Pipecat when LLM produces text.
-        Yields TTSAudioRawFrame per audio chunk, then emits tts-metrics.
-
-        The exact signature and return type may differ across pipecat versions.
-        If this breaks, read pipecat.services.tts_service.TTSService source.
-        """
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
         t_start = time.perf_counter()
         t_first_chunk: float | None = None
         total_samples = 0
 
         try:
-            yield TTSStartedFrame()
+            yield TTSStartedFrame(context_id=context_id)
 
             async for audio_bytes, sr in self.backend.synthesize_streaming(text):
                 if t_first_chunk is None:
@@ -70,33 +51,24 @@ class QwenTTSService(TTSService):
                     audio=audio_bytes,
                     sample_rate=sr,
                     num_channels=1,
+                    context_id=context_id,
                 )
 
-            yield TTSStoppedFrame()
+            yield TTSStoppedFrame(context_id=context_id)
 
         except Exception as e:
             yield ErrorFrame(error=f"QwenTTS error: {e}")
             return
 
-        # Emit metrics after utterance completes
+        # Log metrics
         t_end = time.perf_counter()
         if t_first_chunk is not None and total_samples > 0:
             ttfc_ms = (t_first_chunk - t_start) * 1000
             gen_time = t_end - t_start
-            audio_duration = total_samples / self._sample_rate
-            rtf = gen_time / audio_duration if audio_duration > 0 else None
-            e2e_ms = gen_time * 1000
-
-            # Best-effort: emit custom metrics event if transport supports it
-            # The React dashboard listens for "tts-metrics" via useRTVIClientEvent
-            try:
-                if hasattr(self, "_transport") and hasattr(self._transport, "send_message"):
-                    await self._transport.send_message({
-                        "type": "tts-metrics",
-                        "ttfc_ms": round(ttfc_ms, 1),
-                        "rtf": round(rtf, 4) if rtf is not None else None,
-                        "toks_per_s": None,  # filled by benchmark, not live pipeline
-                        "e2e_ms": round(e2e_ms, 1),
-                    })
-            except Exception:
-                pass  # metrics emission is best-effort — never break the audio path
+            audio_dur = total_samples / self._sample_rate
+            rtf = gen_time / audio_dur if audio_dur > 0 else 0.0
+            import logging
+            logging.getLogger(__name__).info(
+                f"TTS metrics — TTFC={ttfc_ms:.0f}ms RTF={rtf:.3f} "
+                f"audio={audio_dur*1000:.0f}ms e2e={gen_time*1000:.0f}ms"
+            )

@@ -1,0 +1,21 @@
+# Local development — no GPU, no Qwen3-TTS
+# Requires Python 3.11+ (pipecat 1.1.0 uses X | None type syntax)
+# Install: pip install -r requirements-dev.txt
+# Prereq on Mac: brew install ffmpeg
+
+# Pipecat + FastAPI
+pipecat-ai[silero,openai]>=1.1.0
+fastapi
+uvicorn[standard]
+websockets
+python-dotenv
+
+# CPU TTS (no key needed)
+edge-tts
+pydub        # MP3→PCM decode (requires ffmpeg binary)
+
+# STT options
+openai       # For OpenAI Whisper API fallback
+
+# Audio / utilities
+numpy

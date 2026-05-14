@@ -5,6 +5,7 @@ import {
   usePipecatConversation,
   useRTVIClientEvent,
 } from "@pipecat-ai/client-react";
+import { RTVIEvent } from "@pipecat-ai/client-js";
 import { pipecatClient } from "../lib/pipecatClient";
 import Waveform from "./Waveform";
 import LatencyChart from "./LatencyChart";
@@ -49,7 +50,7 @@ function stateLabel(s: string): { label: string; color: string; pulse: boolean }
 // ── main component ─────────────────────────────────────────────────────────
 export default function Dashboard() {
   const transportState = usePipecatClientTransportState();
-  const { isMicEnabled, enableMic, disableMic } = usePipecatClientMicControl();
+  const { isMicEnabled, enableMic } = usePipecatClientMicControl();
   const { messages } = usePipecatConversation();
 
   const [metrics, setMetrics] = useState<Metrics>({
@@ -69,29 +70,30 @@ export default function Dashboard() {
   }, []);
 
   // ── pipecat event hooks ──────────────────────────────────────────────────
-  useRTVIClientEvent("tts-metrics" as never, (data: Metrics) => {
-    setMetrics(data);
-    if (data.e2e_ms != null) {
-      setLatencyHistory(h => [...h.slice(-59), data.e2e_ms!]);
+  useRTVIClientEvent(RTVIEvent.Metrics, (data: unknown) => {
+    const m = data as Metrics;
+    setMetrics(m);
+    if (m.e2e_ms != null) {
+      setLatencyHistory(h => [...h.slice(-59), m.e2e_ms!]);
     }
-    addLog("debug", `metrics ttfc=${data.ttfc_ms?.toFixed(0)}ms rtf=${data.rtf?.toFixed(3)} toks/s=${data.toks_per_s?.toFixed(0)}`);
+    addLog("debug", `metrics ttfc=${m.ttfc_ms?.toFixed(0)}ms rtf=${m.rtf?.toFixed(3)} toks/s=${m.toks_per_s?.toFixed(0)}`);
   });
 
-  useRTVIClientEvent("bot-started-speaking" as never, () => {
+  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => {
     setIsStreaming(true);
     addLog("info", "Bot started speaking — audio streaming");
   });
 
-  useRTVIClientEvent("bot-stopped-speaking" as never, () => {
+  useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, () => {
     setIsStreaming(false);
     addLog("info", "Bot finished speaking");
   });
 
-  useRTVIClientEvent("user-started-speaking" as never, () => {
+  useRTVIClientEvent(RTVIEvent.UserStartedSpeaking, () => {
     addLog("info", "User speech detected");
   });
 
-  useRTVIClientEvent("user-stopped-speaking" as never, () => {
+  useRTVIClientEvent(RTVIEvent.UserStoppedSpeaking, () => {
     addLog("debug", "User speech ended — sending to STT");
   });
 
@@ -175,7 +177,7 @@ export default function Dashboard() {
           </button>
           {connected && (
             <button
-              onClick={() => isMicEnabled ? disableMic() : enableMic()}
+              onClick={() => enableMic(!isMicEnabled)}
               style={{ ...s.micBtn,
                 background: isMicEnabled ? "var(--green-dim)" : "var(--bg-2)",
                 borderColor: isMicEnabled ? "var(--green)" : "var(--border-2)",
@@ -288,7 +290,11 @@ export default function Dashboard() {
                 </div>
               ) : (
                 messages.map((msg, i) => (
-                  <TranscriptEntry key={i} role={msg.role} content={msg.content as string} />
+                  <TranscriptEntry key={i} role={msg.role}
+                    content={msg.parts.map(p =>
+                      typeof p.text === "string" ? p.text : (p.text as { spoken?: string })?.spoken ?? ""
+                    ).join("")}
+                  />
                 ))
               )}
             </div>

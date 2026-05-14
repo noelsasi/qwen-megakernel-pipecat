@@ -1,17 +1,37 @@
-.PHONY: venv install inspect baseline streaming server benchmark kernel
+.PHONY: venv install install-dev dev dev-server inspect baseline streaming server benchmark kernel
 
 VENV = .venv
 PYTHON = $(VENV)/bin/python
 PIP = $(VENV)/bin/pip
 
 venv:
-	python3 -m venv $(VENV)
+	# Use Python 3.11+ — pipecat 1.1.0 requires 3.10+ (X | None syntax)
+	/opt/homebrew/bin/python3.11 -m venv $(VENV) || python3.11 -m venv $(VENV)
 	@echo "Activate with: source .venv/bin/activate"
 
 install: venv
 	# Install PyTorch with CUDA 12.8 FIRST (RTX 5090 requires cu128 build)
 	$(PIP) install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 	$(PIP) install -r requirements.txt
+
+# Local dev — no GPU, no Qwen3-TTS
+install-dev: venv
+	$(PIP) install -r requirements-dev.txt
+
+# Start everything for local dev (server + client)
+dev:
+	@echo "Starting FastAPI server on :8000 and Vite on :5173"
+	@echo "Set OPENAI_API_KEY in .env.local first."
+	$(MAKE) dev-server & \
+	cd client && npm run dev
+
+# FastAPI server with local dev backend (edge-tts, no GPU)
+dev-server:
+	set -a && . ./.env.local && set +a && \
+	$(PYTHON) -m uvicorn server.pipeline.voice_agent:app \
+		--host 127.0.0.1 \
+		--port 8000 \
+		--reload
 
 # Phase A: inspect model structure, print all module names + shapes
 inspect:
