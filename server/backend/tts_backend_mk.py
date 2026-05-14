@@ -211,10 +211,11 @@ class _MKDecoder:
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.bfloat16, device="cuda",
         )
-        # LDG_ATTN_BLOCKS = NUM_Q_HEADS = 16 (confirmed from kernel.cu line 46)
-        n_attn_blocks = NUM_Q_HEADS
-        self._block_max_vals = torch.full((n_attn_blocks,), float("-inf"), dtype=torch.float32, device="cuda")
-        self._block_max_idxs = torch.zeros(n_attn_blocks, dtype=torch.int32, device="cuda")
+        # block_max_vals/idxs are read by ldg_lm_head_fused over LDG_LM_NUM_BLOCKS=1184 entries
+        # (kernel.cu line 1157: for i in range(num_blocks) where num_blocks=LDG_LM_NUM_BLOCKS)
+        LDG_LM_NUM_BLOCKS = 1184
+        self._block_max_vals = torch.full((LDG_LM_NUM_BLOCKS,), float("-inf"), dtype=torch.float32, device="cuda")
+        self._block_max_idxs = torch.zeros(LDG_LM_NUM_BLOCKS, dtype=torch.int32, device="cuda")
         # output_token: single int32 tensor written by decode op
         self._output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
 
