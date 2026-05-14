@@ -43,57 +43,50 @@ def load_model():
     return model, processor
 
 
+SAMPLE_RATE = 24000  # confirmed from model card; position_id_per_seconds=13 → ~13 frames/sec
+
+
 def run_inference(model, processor, text: str):
     """
-    Run single inference. Returns (audio_np, sample_rate).
-    FILL IN after phase_a_inspect_model confirms the correct generate() signature.
+    Run single non-streaming inference. Returns (audio_np, sample_rate, gen_ms).
+
+    generate() signature (confirmed from inspection):
+      input_ids, instruct_ids, ref_ids, voice_clone_prompt, languages, speakers,
+      non_streaming_mode, max_new_tokens, do_sample, top_k, top_p, temperature,
+      subtalker_dosample, subtalker_top_k, subtalker_top_p, subtalker_temperature,
+      eos_token_id, repetition_penalty
     """
-    # Tokenize
-    inputs = processor(text=text, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    input_ids = processor(text, return_tensors="pt").input_ids.to(model.device)
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     with torch.inference_mode():
-        # Adjust generate() kwargs from inspect output
         outputs = model.generate(
-            **inputs,
-            max_new_tokens=2048,
+            input_ids=[input_ids[0]],
+            non_streaming_mode=True,
+            max_new_tokens=4096,
             do_sample=True,
             temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            repetition_penalty=1.05,
         )
 
     torch.cuda.synchronize()
     gen_ms = (time.perf_counter() - t0) * 1000
 
-    # Extract audio — format TBD from A.3 inspection
-    # Common patterns:
-    #   outputs.audio          (tensor)
-    #   outputs.waveform       (tensor)
-    #   outputs[0]             (tensor)
-    #   processor.decode(outputs) → numpy
-    #
-    # Attempt auto-detection:
-    if hasattr(outputs, "audio"):
-        audio = outputs.audio.cpu().float().numpy()
-    elif hasattr(outputs, "waveform"):
-        audio = outputs.waveform.cpu().float().numpy()
-    elif isinstance(outputs, torch.Tensor):
-        audio = outputs.cpu().float().numpy()
+    # outputs is a list of audio tensors (one per batch item)
+    if isinstance(outputs, (list, tuple)):
+        audio = outputs[0]
     else:
-        # Last resort: ask processor to decode
-        audio = processor.batch_decode(outputs, skip_special_tokens=True)
-        print(f"WARNING: unexpected output type: {type(outputs)} — decoded as: {type(audio)}")
+        audio = outputs
 
-    # Flatten to 1D if (1, N) or (1, 1, N)
-    if isinstance(audio, np.ndarray):
-        audio = audio.squeeze()
+    if isinstance(audio, torch.Tensor):
+        audio = audio.cpu().float().numpy()
 
-    # Sample rate — most likely 24000 from model card
-    sr = getattr(processor, "sampling_rate", None) or getattr(model.config, "sampling_rate", 24000)
-
-    return audio, sr, gen_ms
+    audio = audio.squeeze()
+    return audio, SAMPLE_RATE, gen_ms
 
 
 def warmup(model, processor):

@@ -16,15 +16,19 @@ import sys
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 KERNEL_PATH = "qwen_megakernel/csrc/kernel.cu"
 
-# Known values from config.json inspection (2026-05-14):
-# talker config is nested inside config.json under a sub-key (not a separate file)
-# vocab_size: 3072  (codec tokens — NOT text tokens; megakernel default 151936 is WRONG)
-# num_key_value_heads: 8
-# rope_theta: 1000000
-# text_hidden_size: 2048  (talker hidden size)
-# text_vocab_size: 151936 (text encoder vocab, separate from talker codec vocab)
-# position_id_per_seconds: 13  (frame rate hint: ~13 codec frames/sec)
-# rope_scaling: interleaved MRope with sections [24, 20, 20]
+# Confirmed values from phase_a_inspect_model.py (2026-05-14):
+# num_hidden_layers: 28        → megakernel NUM_LAYERS=28 matches
+# num_attention_heads: 16      → megakernel NUM_HEADS=32 MISMATCH — must change to 16
+# num_key_value_heads: 8       → megakernel NUM_KV_HEADS=8 matches
+# hidden_size (talker): 1024   → megakernel HIDDEN_SIZE=1024 matches (from lm_head [2048,1024])
+# intermediate_size: 3072      → megakernel INTERMEDIATE_SIZE=3072 matches
+# vocab_size: 3072             → megakernel VOCAB_SIZE=151936 MISMATCH — must change to 3072
+# max_position_embeddings: 32768 → megakernel MAX_SEQ_LEN=2048 MISMATCH — increase
+# rope_theta: 1000000          → megakernel must match
+# rope_scaling: interleaved MRope [24,20,20] — megakernel may not support MRope (critical risk)
+# num_code_groups: 16          → 16 codebooks in code predictor
+# position_id_per_seconds: 13  → ~13 codec frames/sec → ~77ms audio per frame
+# text_hidden_size: 2048       → text encoder projection into 1024 talker hidden
 
 
 def extract_kernel_constants(kernel_path: str) -> dict:

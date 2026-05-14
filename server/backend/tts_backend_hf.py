@@ -1,18 +1,29 @@
 """
 Phase A/B/C — HuggingFace TTS backend.
 
-Wraps Qwen3-TTS model inference as an async streaming generator.
-This is a best-effort implementation; exact generate() kwargs and output
-extraction may need adjustment after running phase_a_inspect_model.py.
+Confirmed API (from phase_a_inspect_model.py output):
+  Class:     Qwen3TTSForConditionalGeneration (qwen_tts.core.models)
+  Processor: Qwen3TTSProcessor
+  generate() key params:
+    input_ids: list[torch.Tensor]   — list of 1D tensors, one per batch item
+    non_streaming_mode: bool        — False = streaming (default), True = batch
+    max_new_tokens, do_sample, temperature, top_k, top_p, repetition_penalty
+    subtalker_dosample, subtalker_temperature, subtalker_top_k, subtalker_top_p
+  Talker hidden size: 1024  (from lm_head weight shapes)
+  Code predictor: model.talker.code_predictor (16 lm_head outputs → 16 codebooks)
+  Vocab size: 3072 codec tokens
+  Sample rate: 24000 Hz
+  Frame rate: ~13 frames/sec (position_id_per_seconds=13)
 
 Interface:
-    backend = QwenTTSBackendHF(model_id="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+    backend = QwenTTSBackendHF()
     async for audio_bytes, sample_rate in backend.synthesize_streaming("Hello"):
-        # audio_bytes: int16 PCM bytes
-        # sample_rate: int (e.g. 24000)
+        ...  # audio_bytes: int16 PCM, sample_rate: 24000
 """
 
 import asyncio
+import queue
+import threading
 import time
 import numpy as np
 import torch
@@ -20,12 +31,10 @@ from collections.abc import AsyncGenerator
 
 
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-
-# Chunk size for fake-streaming fallback (100ms chunks at 24kHz)
-_CHUNK_MS = 100
+SAMPLE_RATE = 24000
 
 
-def _audio_to_int16_bytes(audio: np.ndarray) -> bytes:
+def _to_int16_bytes(audio: np.ndarray) -> bytes:
     if audio.dtype != np.int16:
         audio = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
     return audio.tobytes()
@@ -45,56 +54,93 @@ class QwenTTSBackendHF:
         )
         self.model.eval()
         self.processor = Qwen3TTSProcessor.from_pretrained(model_id)
-        self.sample_rate = getattr(self.processor, "sampling_rate", 24000) or 24000
+        self.sample_rate = SAMPLE_RATE
+        self.device = device
 
-        load_ms = (time.perf_counter() - t0) * 1000
-        print(f"[QwenTTSBackendHF] Loaded in {load_ms:.0f}ms  sr={self.sample_rate}")
+        print(f"[QwenTTSBackendHF] Loaded in {(time.perf_counter()-t0)*1000:.0f}ms")
 
-    def _run_inference(self, text: str) -> np.ndarray:
-        """Blocking inference — runs full generate() and returns float32 audio."""
-        inputs = self.processor(text=text, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+    def _input_ids(self, text: str) -> list:
+        ids = self.processor(text, return_tensors="pt").input_ids.to(self.model.device)
+        return [ids[0]]
 
+    def _generate_kwargs(self) -> dict:
+        return dict(
+            max_new_tokens=4096,
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            repetition_penalty=1.05,
+            subtalker_dosample=True,
+            subtalker_temperature=0.9,
+            subtalker_top_k=50,
+            subtalker_top_p=1.0,
+        )
+
+    def run_batch(self, text: str) -> np.ndarray:
+        """Blocking full inference. Returns float32 audio array."""
+        input_ids = self._input_ids(text)
         with torch.inference_mode():
             outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=2048,
-                do_sample=True,
-                temperature=0.9,
+                input_ids=input_ids,
+                non_streaming_mode=True,
+                **self._generate_kwargs(),
             )
-
-        # Extract audio — auto-detect output format from inspect results
-        if hasattr(outputs, "audio"):
-            audio = outputs.audio.cpu().float().numpy().squeeze()
-        elif hasattr(outputs, "waveform"):
-            audio = outputs.waveform.cpu().float().numpy().squeeze()
-        elif isinstance(outputs, torch.Tensor):
-            audio = outputs.cpu().float().numpy().squeeze()
-        else:
-            # Processor-based decode fallback
-            audio = self.processor.batch_decode(outputs, skip_special_tokens=True)
-            if isinstance(audio, list):
-                audio = np.array(audio[0], dtype=np.float32)
-
-        return audio
+        audio = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+        if isinstance(audio, torch.Tensor):
+            audio = audio.cpu().float().numpy()
+        return audio.squeeze()
 
     async def synthesize_streaming(
         self, text: str
     ) -> AsyncGenerator[tuple[bytes, int], None]:
         """
-        Yields (audio_bytes: bytes, sample_rate: int) in chunks.
+        Real streaming: generate() runs with non_streaming_mode=False (default),
+        which yields audio chunks incrementally via a queue on a background thread.
 
-        Uses fake streaming (full inference then chunk) until Phase B confirms
-        a real streaming path is available.
+        If the model's streaming API yields tensors/arrays directly, we forward them.
+        Falls back to chunked batch output if streaming API is not iterable.
         """
         loop = asyncio.get_event_loop()
+        q: queue.Queue = queue.Queue()
+        _DONE = object()
 
-        # Run blocking inference on a thread so we don't block the event loop
-        audio = await loop.run_in_executor(None, self._run_inference, text)
+        def _stream():
+            try:
+                input_ids = self._input_ids(text)
+                with torch.inference_mode():
+                    result = self.model.generate(
+                        input_ids=input_ids,
+                        non_streaming_mode=False,
+                        **self._generate_kwargs(),
+                    )
+                # If result is iterable (generator), forward each chunk
+                if hasattr(result, "__iter__") and not isinstance(result, (torch.Tensor, np.ndarray)):
+                    for chunk in result:
+                        if isinstance(chunk, torch.Tensor):
+                            chunk = chunk.cpu().float().numpy().squeeze()
+                        q.put(chunk)
+                else:
+                    # non_streaming_mode=False returned full audio — chunk it
+                    audio = result[0] if isinstance(result, (list, tuple)) else result
+                    if isinstance(audio, torch.Tensor):
+                        audio = audio.cpu().float().numpy()
+                    audio = audio.squeeze()
+                    chunk_samples = SAMPLE_RATE // 10  # 100ms chunks
+                    for i in range(0, len(audio), chunk_samples):
+                        q.put(audio[i : i + chunk_samples])
+            except Exception as e:
+                q.put(e)
+            finally:
+                q.put(_DONE)
 
-        chunk_samples = int(self.sample_rate * _CHUNK_MS / 1000)
+        thread = threading.Thread(target=_stream, daemon=True)
+        thread.start()
 
-        for i in range(0, len(audio), chunk_samples):
-            chunk = audio[i : i + chunk_samples]
-            yield _audio_to_int16_bytes(chunk), self.sample_rate
-            await asyncio.sleep(0)  # yield to event loop between chunks
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield _to_int16_bytes(item), self.sample_rate
