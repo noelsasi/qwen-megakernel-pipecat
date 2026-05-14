@@ -186,16 +186,23 @@ class _MKDecoder:
         self._lm_head_weight = weights["lm_head_weight"]
         self._layer_weights_packed = _pack_layer_weights(weights["layer_weights"])
 
-        # Working buffers — passed as void* to kernel, sizes match diagnostic
+        # Dtypes from kernel.cu launch_ldg_decode_direct (lines 1197-1201):
+        #   hidden_buffer       → bfloat16
+        #   g_activations       → float32
+        #   g_residual          → float32
+        #   g_q, g_k, g_v       → float32
+        #   g_attn_out          → float32
+        #   g_mlp_intermediate  → float32
+        #   g_normalized        → float32
         self._hidden = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        self._activations = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        self._residual = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        self._q = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        self._k = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        self._v = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        self._attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        self._mlp_intermediate = torch.zeros(VOCAB_SIZE * 2, dtype=torch.bfloat16, device="cuda")
-        self._normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._activations = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        self._residual = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        self._q = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._k = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._v = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._mlp_intermediate = torch.zeros(VOCAB_SIZE, dtype=torch.float32, device="cuda")
+        self._normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
         self._k_cache = torch.zeros(
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.bfloat16, device="cuda",
