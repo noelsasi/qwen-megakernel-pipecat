@@ -1,0 +1,30 @@
+# Install with: pip install -r requirements.txt
+# GPU: CUDA 12.8+, RTX 5090 — install torch FIRST with:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Core inference
+transformers>=4.51.0
+huggingface_hub
+accelerate
+
+# Pipecat pipeline
+pipecat-ai[silero,google]>=0.0.50
+
+# FastAPI server
+fastapi
+uvicorn[standard]
+websockets
+
+# Audio
+soundfile
+numpy
+
+# STT options (pick one at runtime, both listed for flexibility)
+openai-whisper
+deepgram-sdk
+
+# Build tooling (megakernel)
+pybind11
+
+# Dev / benchmarking
+nvitop
