@@ -436,11 +436,22 @@ class QwenTTSBackendMK:
             # Step 2: tight decode loop — no HF overhead
             max_steps = kwargs.get("max_new_tokens", 4096)
             tokens = []
+            # hidden_states format HF expects:
+            # tuple of per-step tuples, each = (layer_hidden_states,)
+            # where layer_hidden_states is a tensor [1, 1, HIDDEN_SIZE]
+            # line 2280: hid[-1] = last tuple entry = last layer hidden state
+            # line 2281: hid[0][-1][:, -1:] = first entry, last layer, last pos
+            # We store one entry per step: a tuple containing one [1,1,HIDDEN_SIZE] tensor
+            hidden_states_list = []
             current = first_token
             t0 = time.perf_counter()
             with torch.inference_mode():
                 for _ in range(max_steps):
                     next_tok = decoder.step(current)
+                    # Capture hidden state for this step [1, 1, HIDDEN_SIZE]
+                    h = decoder._hidden.detach().clone().view(1, 1, HIDDEN_SIZE)
+                    # Each step entry: tuple of layer hiddens; we only have final layer
+                    hidden_states_list.append((h,))
                     if next_tok == EOS_TOKEN_ID:
                         break
                     tokens.append(next_tok)
@@ -450,11 +461,12 @@ class QwenTTSBackendMK:
             n = len(tokens)
             print(f"[MK] Decode complete — {n} tokens in {elapsed*1000:.0f}ms ({n/elapsed:.0f} tok/s)")
 
-            # Return as HF expects: GenerateOutput with sequences [1, N]
-            # HF uses .sequences from the generate output
             from types import SimpleNamespace
             token_tensor = torch.tensor(tokens, dtype=torch.long, device="cuda").unsqueeze(0)
-            return SimpleNamespace(sequences=token_tensor)
+            return SimpleNamespace(
+                sequences=token_tensor,
+                hidden_states=tuple(hidden_states_list),
+            )
 
         self._hf.model.talker.generate = _mk_generate
         try:
