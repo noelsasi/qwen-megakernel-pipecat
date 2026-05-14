@@ -58,6 +58,14 @@ RTF 0.879 means the model generates audio almost in real-time but NOT faster —
 
 - [ ] **Phase B** — Real streaming: hook `generate()` internals to yield audio chunks before full generation completes (reduces TTFC)
 - [ ] **Phase C** — Pipecat pipeline end-to-end (STT → LLM → TTS → speaker)
-- [ ] **Phase D** — Megakernel: clone repo, run compat check, resolve MRope risk
+- [ ] **Phase D** — Megakernel: patch kernel.cu (VOCAB_SIZE), build, wire decode loop
+  - [x] Clone megakernel repo
+  - [x] Compat matrix complete — only 2 constant changes needed + MRope tables
+  - [x] Weight extraction code written (tts_backend_mk.py)
+  - [x] MRope cos/sin table builder written
+  - [ ] Patch kernel.cu: `LDG_VOCAB_SIZE 151936 → 3072`
+  - [ ] Build megakernel: `cd qwen_megakernel && pip install -e .`
+  - [ ] Wire prefill handoff: HF prefill → megakernel decode loop
+  - [ ] Validate output matches HF baseline (same audio)
 - [ ] flash-attn install — likely gives meaningful speedup on RTX 5090
 - [ ] HF_TOKEN set on server (currently unauthenticated — hitting rate limits)

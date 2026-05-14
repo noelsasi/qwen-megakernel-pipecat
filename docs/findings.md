@@ -128,23 +128,24 @@ Source: `qwen_megakernel/csrc/kernel.cu` (confirmed from source) vs model config
 | `HIDDEN_SIZE` | 1024 | 1024 | ✅ | — |
 | `INTERMEDIATE_SIZE` | 3072 | 3072 | ✅ | — |
 | `LDG_RMS_EPS` | 1e-6 | 1e-6 | ✅ | — |
-| `HEAD_DIM` | **128** | **64** (=1024/16) | ❌ | Change to 64; ripples into Q_SIZE, KV_SIZE |
+| `HEAD_DIM` | 128 | **128** (confirmed from weight shapes) | ✅ | — |
+| `Q_SIZE` | 16×128=2048 | 2048 (q_proj out dim confirmed) | ✅ | — |
+| `KV_SIZE` | 8×128=1024 | 1024 (k_proj out dim confirmed) | ✅ | — |
 | `LDG_VOCAB_SIZE` | **151936** | **3072** | ❌ | Change to 3072 |
-| `Q_SIZE` | 16×128=2048 | 16×64=1024 | ❌ | Derived — fixed when HEAD_DIM fixed |
-| `KV_SIZE` | 8×128=1024 | 8×64=512 | ❌ | Derived — fixed when HEAD_DIM fixed |
-| NUM_LAYERS | not found yet | 28 | ? | Verify in source |
-| rope_theta | not found yet | 1,000,000 | ? | Verify in source |
-| RoPE type | **standard RoPE only** | **interleaved MRope** | ❌ | Critical — needs new impl |
+| NUM_LAYERS | 28 (from model.py) | 28 | ✅ | — |
+| rope_theta | 10000 (from model.py) | **1,000,000** | ❌ | Change in Python table builder |
+| RoPE type | standard RoPE | **interleaved MRope** | ❌ | Python-side fix only |
+| MAX_SEQ_LEN | 2048 | 32768 | ❌ | Increase in model.py constant |
 
-> `HEAD_DIM = HIDDEN_SIZE / NUM_Q_HEADS = 1024 / 16 = 64`  
-> The kernel was written for Qwen3-0.6B text model (HEAD_DIM=128, VOCAB=151936).  
-> The TTS talker has the same layer structure but different HEAD_DIM and vocab.
+> Earlier HEAD_DIM=64 estimate was wrong. Confirmed from weight shapes:  
+> `q_proj [2048, 1024]` → 16 heads × 128 = 2048. HEAD_DIM=128 all along.  
+> `mrope_section [24,20,20]` sums to 64 = HEAD_DIM//2 — consistent with Qwen3-VL pattern.
 
-**Confirmed mismatches requiring kernel changes:**
-1. `HEAD_DIM 128 → 64` — all attention buffer sizing must be recalculated
-2. `LDG_VOCAB_SIZE 151936 → 3072` — LM head output projection size
-3. `Q_SIZE / KV_SIZE` — derived, auto-fixed when HEAD_DIM changes
-4. **Interleaved MRope** — standard RoPE in kernel must be replaced (see RoPE section below)
+**Confirmed mismatches (reduced from earlier estimate):**
+1. `LDG_VOCAB_SIZE 151936 → 3072` — one constant change in kernel.cu
+2. `rope_theta 10000 → 1,000,000` — change in Python `load_weights()` in model.py
+3. `MAX_SEQ_LEN 2048 → 32768` — change in model.py constant (affects KV cache allocation)
+4. **Interleaved MRope** — replace `build_rope_tables()` in Python; kernel inner loop unchanged
 
 **RoPE situation — better than feared:**
 - Kernel RoPE reads from precomputed `cos_pos` / `sin_pos` pointer args — theta is NOT hardcoded
@@ -165,23 +166,28 @@ Source: `qwen_megakernel/csrc/kernel.cu` (confirmed from source) vs model config
 - **MRope fix:** Replace `torch.outer(positions, inv_freq)` with a concatenation of three frequency bands for mrope_sections [24,20,20], each with the same theta but different position_id streams (time, text, audio)
 - This is purely Python — the CUDA kernel is unchanged
 
-**Weight key mapping (confirmed from model.py):**
-```
-model.layers.{i}.input_layernorm.weight
-model.layers.{i}.self_attn.q_proj.weight
-model.layers.{i}.self_attn.k_proj.weight
-model.layers.{i}.self_attn.v_proj.weight
-model.layers.{i}.self_attn.q_norm.weight
-model.layers.{i}.self_attn.k_norm.weight
-model.layers.{i}.self_attn.o_proj.weight
-model.layers.{i}.post_attention_layernorm.weight
-model.layers.{i}.mlp.gate_proj.weight
-model.layers.{i}.mlp.up_proj.weight
-model.layers.{i}.mlp.down_proj.weight
-```
-These are the keys megakernel expects. Must verify these match `model.model.state_dict()` keys from the TTS talker.
+**Weight key mapping (confirmed from state_dict inspection):**
 
-**LM head:** Uses tied embeddings (`lm_head_weight = embed_weight`). TTS talker has its own lm_head — NOT tied. Must pass talker's actual lm_head weight.
+| Megakernel expects | HF state_dict key | Shape |
+|-------------------|-------------------|-------|
+| `model.layers.{i}.input_layernorm.weight` | `talker.model.layers.{i}.input_layernorm.weight` | [1024] |
+| `model.layers.{i}.self_attn.q_proj.weight` | `talker.model.layers.{i}.self_attn.q_proj.weight` | [2048, 1024] |
+| `model.layers.{i}.self_attn.k_proj.weight` | `talker.model.layers.{i}.self_attn.k_proj.weight` | [1024, 1024] |
+| `model.layers.{i}.self_attn.v_proj.weight` | `talker.model.layers.{i}.self_attn.v_proj.weight` | [1024, 1024] |
+| `model.layers.{i}.self_attn.q_norm.weight` | `talker.model.layers.{i}.self_attn.q_norm.weight` | [128] |
+| `model.layers.{i}.self_attn.k_norm.weight` | `talker.model.layers.{i}.self_attn.k_norm.weight` | [128] |
+| `model.layers.{i}.self_attn.o_proj.weight` | `talker.model.layers.{i}.self_attn.o_proj.weight` | [1024, 2048] |
+| `model.layers.{i}.post_attention_layernorm.weight` | `talker.model.layers.{i}.post_attention_layernorm.weight` | [1024] |
+| `model.layers.{i}.mlp.gate_proj.weight` | `talker.model.layers.{i}.mlp.gate_proj.weight` | [3072, 1024] |
+| `model.layers.{i}.mlp.up_proj.weight` | `talker.model.layers.{i}.mlp.up_proj.weight` | [3072, 1024] |
+| `model.layers.{i}.mlp.down_proj.weight` | `talker.model.layers.{i}.mlp.down_proj.weight` | [1024, 3072] |
+| `embed_weight` | `talker.model.codec_embedding.weight` | [3072, 1024] |
+| `final_norm_weight` | `talker.model.norm.weight` | [1024] |
+| `lm_head_weight` | `talker.codec_head.weight` | [3072, 1024] — **NOT tied** |
+
+**LM head is NOT tied:** megakernel text model used `lm_head_weight = embed_weight` (tied embeddings). TTS talker has a separate `codec_head` — must pass it explicitly.
+
+**o_proj shape:** [1024, 2048] — non-square (in=2048=16heads×128, out=1024). Verify megakernel kernel handles this correctly (it may assume square or [out, in] layout).
 
 **Summary:** 5 confirmed mismatches, 1 critical (MRope). Simple `#define` changes fix 4 of them. MRope requires actual kernel code changes.
 
