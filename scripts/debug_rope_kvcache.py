@@ -38,18 +38,15 @@ orig_attn_fwd = attn.forward
 captured = {}
 
 def spy_attn(*args, **kwargs):
-    # Patch inside the attention to capture pre/post RoPE keys
-    orig_apply_rope = None
-    import qwen_tts.core.models.modeling_qwen3_tts as mod
-
-    # Capture the raw K projection output before RoPE
+    # Capture the raw K projection output before RoPE — prefill only (seq > 1)
     orig_k_proj = attn.k_proj.forward
     def spy_k_proj(x):
         out = orig_k_proj(x)
-        captured["k_raw"] = out.detach().clone()
+        # x shape: [1, seq_len, hidden] — only capture prefill
+        if x.shape[1] > 1 and "k_raw" not in captured:
+            captured["k_raw"] = out.detach().clone()
         return out
     attn.k_proj.forward = spy_k_proj
-
     result = orig_attn_fwd(*args, **kwargs)
     attn.k_proj.forward = orig_k_proj
     return result
