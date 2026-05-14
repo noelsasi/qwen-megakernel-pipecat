@@ -480,7 +480,6 @@ class QwenTTSBackendMK:
                 )
         finally:
             self._hf.model.talker.generate = orig_generate
-            self._hf.model.talker.model.forward = orig_forward
 
         audio = np.array(wavs[0], dtype=np.float32).squeeze()
         return audio
