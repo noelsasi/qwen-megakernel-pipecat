@@ -51,59 +51,28 @@ def step3_load_and_inspect():
     print("=" * 60)
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoProcessor, AutoModel
+    # qwen3_tts is a separate package — install with: pip install -U qwen-tts
+    from qwen_tts.core.models import Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
 
-    # qwen3_tts requires transformers installed from source (not any released version).
-    # If this fails with "does not recognize this architecture", run:
-    #   pip install git+https://github.com/huggingface/transformers.git
-    print("Attempting: AutoModel.from_pretrained (trust_remote_code=True) ...")
+    print("Loading via qwen_tts package ...")
     try:
-        model = AutoModel.from_pretrained(
+        model = Qwen3TTSForConditionalGeneration.from_pretrained(
             MODEL_ID,
             device_map="cpu",
             torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
         )
         print(f"Loaded as: {type(model).__name__}")
     except Exception as e:
-        print(f"AutoModel failed: {e}")
-        print("Trying Qwen3TtsForConditionalGeneration directly ...")
-        try:
-            from transformers import Qwen3TtsForConditionalGeneration, Qwen3TtsProcessor
-            model = Qwen3TtsForConditionalGeneration.from_pretrained(
-                MODEL_ID,
-                device_map="cpu",
-                torch_dtype=torch.bfloat16,
-            )
-            print(f"Loaded as: {type(model).__name__}")
-        except Exception as e2:
-            print(f"Qwen3TtsForConditionalGeneration also failed: {e2}")
-            print("Trying AutoModelForCausalLM ...")
-            try:
-                model = AutoModelForCausalLM.from_pretrained(
-                    MODEL_ID,
-                    device_map="cpu",
-                    torch_dtype=torch.bfloat16,
-                    trust_remote_code=True,
-                )
-                print(f"Loaded as: {type(model).__name__}")
-            except Exception as e3:
-                print(f"All load attempts failed: {e3}")
-                print("STOP: Install transformers from source: pip install git+https://github.com/huggingface/transformers.git")
-                sys.exit(1)
+        print(f"Load failed: {e}")
+        print("STOP: Run: pip install -U qwen-tts")
+        sys.exit(1)
 
     try:
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+        processor = Qwen3TTSProcessor.from_pretrained(MODEL_ID)
         print(f"Processor loaded: {type(processor).__name__}")
     except Exception as e:
-        print(f"AutoProcessor failed: {e}")
-        try:
-            from transformers import Qwen3TtsProcessor
-            processor = Qwen3TtsProcessor.from_pretrained(MODEL_ID)
-            print(f"Processor loaded via Qwen3TtsProcessor: {type(processor).__name__}")
-        except Exception as e2:
-            print(f"Qwen3TtsProcessor also failed: {e2}")
-            processor = None
+        print(f"Processor load failed: {e}")
+        processor = None
 
     print("\n--- NAMED MODULES ---")
     for name, module in model.named_modules():

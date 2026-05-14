@@ -33,19 +33,18 @@ def _audio_to_int16_bytes(audio: np.ndarray) -> bytes:
 
 class QwenTTSBackendHF:
     def __init__(self, model_id: str = MODEL_ID, device: str = "cuda"):
-        # Requires transformers from source: pip install git+https://github.com/huggingface/transformers.git
-        from transformers import Qwen3TtsForConditionalGeneration, Qwen3TtsProcessor
+        from qwen_tts.core.models import Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
 
         print(f"[QwenTTSBackendHF] Loading {model_id} ...")
         t0 = time.perf_counter()
 
-        self.model = Qwen3TtsForConditionalGeneration.from_pretrained(
+        self.model = Qwen3TTSForConditionalGeneration.from_pretrained(
             model_id,
             device_map=device,
             torch_dtype=torch.bfloat16,
         )
         self.model.eval()
-        self.processor = Qwen3TtsProcessor.from_pretrained(model_id)
+        self.processor = Qwen3TTSProcessor.from_pretrained(model_id)
         self.sample_rate = getattr(self.processor, "sampling_rate", 24000) or 24000
 
         load_ms = (time.perf_counter() - t0) * 1000

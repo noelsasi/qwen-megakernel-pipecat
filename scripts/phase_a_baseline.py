@@ -22,20 +22,19 @@ OUTPUT_PATH = "output_baseline.wav"
 
 
 def load_model():
-    # Requires transformers from source: pip install git+https://github.com/huggingface/transformers.git
-    from transformers import Qwen3TtsForConditionalGeneration, Qwen3TtsProcessor
+    from qwen_tts.core.models import Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
 
     print(f"Loading model: {MODEL_ID}")
     t0 = time.perf_counter()
 
-    model = Qwen3TtsForConditionalGeneration.from_pretrained(
+    model = Qwen3TTSForConditionalGeneration.from_pretrained(
         MODEL_ID,
         device_map="cuda",
         torch_dtype=torch.bfloat16,
     )
     model.eval()
 
-    processor = Qwen3TtsProcessor.from_pretrained(MODEL_ID)
+    processor = Qwen3TTSProcessor.from_pretrained(MODEL_ID)
 
     load_ms = (time.perf_counter() - t0) * 1000
     print(f"Model load: {load_ms:.0f}ms")
