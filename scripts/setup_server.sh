@@ -29,7 +29,10 @@ print(f'PyTorch CUDA OK: {torch.cuda.get_device_name(0)}')
 print(f'CUDA version: {torch.version.cuda}')
 "
 
-# Project dependencies
+# transformers from source (qwen3_tts not in any released version yet)
+pip install git+https://github.com/huggingface/transformers.git
+
+# Remaining project dependencies
 pip install -r requirements.txt
 
 # Clone megakernel (Phase D)

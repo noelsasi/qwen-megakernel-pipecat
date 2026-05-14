@@ -16,6 +16,16 @@ import sys
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 KERNEL_PATH = "qwen_megakernel/csrc/kernel.cu"
 
+# Known values from config.json inspection (2026-05-14):
+# talker config is nested inside config.json under a sub-key (not a separate file)
+# vocab_size: 3072  (codec tokens — NOT text tokens; megakernel default 151936 is WRONG)
+# num_key_value_heads: 8
+# rope_theta: 1000000
+# text_hidden_size: 2048  (talker hidden size)
+# text_vocab_size: 151936 (text encoder vocab, separate from talker codec vocab)
+# position_id_per_seconds: 13  (frame rate hint: ~13 codec frames/sec)
+# rope_scaling: interleaved MRope with sections [24, 20, 20]
+
 
 def extract_kernel_constants(kernel_path: str) -> dict:
     """Extract #define constants from kernel.cu."""

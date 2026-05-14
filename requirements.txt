@@ -3,7 +3,8 @@
 #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # Core inference
-transformers>=4.51.0
+# qwen3_tts architecture is not in any released transformers version yet — must install from source
+git+https://github.com/huggingface/transformers.git
 huggingface_hub
 accelerate
 
