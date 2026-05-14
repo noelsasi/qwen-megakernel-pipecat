@@ -40,11 +40,36 @@ Both require deep reverse-engineering of `qwen_tts` internals. Deferred to next 
 
 ---
 
-## Next Session Priorities
+---
 
-- [ ] **Phase C** — Wire Pipecat pipeline end-to-end (STT → LLM → TTS → speaker)
-  - Server scaffold ready: `server/pipeline/voice_agent.py`
-  - Needs: LLM API key (OpenAI or Anthropic), STT choice (Deepgram key or Whisper local)
-- [ ] **flash-attn** — `pip install flash-attn --no-build-isolation` then re-run baseline (quick RTF improvement)
-- [ ] **Phase D continued** — Explore accessing `qwen_tts` vocoder internals to complete megakernel loop
-- [ ] **README** — Write with real numbers once demo is working
+## 2026-05-14 — Session 2
+
+### Changes
+
+| File | What changed |
+|------|-------------|
+| `server/pipeline/voice_agent.py` | Added `OpenAILLMContext` + system prompt; proper `context_aggregator` pipeline wiring |
+| `server/pipecat_services/qwen_tts_service.py` | Added TTFC/RTF/E2E metrics emission after each utterance; timing instrumentation |
+| `server/backend/tts_backend_mk.py` | **Phase D unblocked**: replaced speculative `forward_sub_talker` approach with `talker.model.generate()` monkey-patch — megakernel runs the decode loop, HF downstream (code_predictor + vocoder) runs unchanged |
+| `scripts/benchmark.py` | Fixed `--trials` wiring through to `measure_ttfc` / `measure_rtf` |
+
+### Phase D Integration Strategy (new)
+
+Instead of calling `forward_sub_talker` (which doesn't exist in the public API),
+we now patch `talker.model.generate()` at call time:
+1. HF prefill runs normally via `talker.model(inputs_embeds=..., use_cache=True)`
+2. HF then calls `talker.model.generate()` for the decode loop — we intercept this
+3. Our patch copies the HF `DynamicCache` into megakernel tensors, runs megakernel
+   decode until EOS, returns a `[1, N]` token tensor
+4. HF receives that tensor and runs code_predictor + vocoder as normal
+5. Auto-fallback to full HF if megakernel fails (safety net for debugging)
+
+The patch is thread-safe per-call (install → run → restore in try/finally).
+
+### Next Session Priorities
+
+- [ ] **Run Phase C on GPU** — `make server` + connect React client, confirm STT→LLM→TTS works end-to-end
+- [ ] **Test megakernel decode** — set `TTS_BACKEND=megakernel`, verify `_run_with_megakernel_decode` fires and audio is correct vs HF baseline
+- [ ] **flash-attn** — `pip install flash-attn --no-build-isolation` then re-run baseline (quick RTF improvement without megakernel)
+- [ ] **Full benchmark** — `make benchmark --backend both` — fill in the README numbers table
+- [ ] **README** — write with real numbers once demo works

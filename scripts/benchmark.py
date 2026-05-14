@@ -85,7 +85,7 @@ def measure_toks_per_second(decoder, warmup_steps=10, measure_steps=100, trials=
     return mean, std
 
 
-async def run_benchmark(backend_name: str, backend):
+async def run_benchmark(backend_name: str, backend, trials: int = 5):
     print(f"\n{'=' * 60}")
     print(f"Backend: {backend_name}")
     print("=" * 60)
@@ -95,8 +95,8 @@ async def run_benchmark(backend_name: str, backend):
         label = text[:40] + ("..." if len(text) > 40 else "")
         print(f"\nText: '{label}'")
 
-        ttfc_mean, ttfc_std = await measure_ttfc(backend, text)
-        rtf_mean, rtf_std = await measure_rtf(backend, text)
+        ttfc_mean, ttfc_std = await measure_ttfc(backend, text, trials=trials)
+        rtf_mean, rtf_std = await measure_rtf(backend, text, trials=trials)
 
         print(f"  TTFC: {ttfc_mean:.1f} ± {ttfc_std:.1f} ms  (target < 60ms: {'PASS' if ttfc_mean < 60 else 'FAIL'})")
         print(f"  RTF:  {rtf_mean:.3f} ± {rtf_std:.3f}     (target < 0.15: {'PASS' if rtf_mean < 0.15 else 'FAIL'})")
@@ -127,12 +127,12 @@ def main():
     if args.backend in ("hf", "both"):
         from server.backend.tts_backend_hf import QwenTTSBackendHF
         hf_backend = QwenTTSBackendHF(model_id=args.model_id)
-        asyncio.run(run_benchmark("HuggingFace baseline", hf_backend))
+        asyncio.run(run_benchmark("HuggingFace baseline", hf_backend, trials=args.trials))
 
     if args.backend in ("megakernel", "both"):
         from server.backend.tts_backend_mk import QwenTTSBackendMK
         mk_backend = QwenTTSBackendMK(model_id=args.model_id, megakernel_path="./qwen_megakernel")
-        asyncio.run(run_benchmark("Megakernel", mk_backend))
+        asyncio.run(run_benchmark("Megakernel", mk_backend, trials=args.trials))
 
         print("\n--- tok/s (megakernel decode step) ---")
         tok_mean, tok_std = measure_toks_per_second(mk_backend.mk_decoder)

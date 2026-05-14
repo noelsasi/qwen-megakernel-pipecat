@@ -1,0 +1,78 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Geist:wght@300;400;500;600&display=swap');
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg:         #080a0f;
+  --bg-1:       #0d1018;
+  --bg-2:       #111520;
+  --border:     rgba(255,255,255,0.06);
+  --border-2:   rgba(255,255,255,0.10);
+  --text:       #8892a4;
+  --text-2:     #c8d0dc;
+  --text-hi:    #eef2f8;
+  --cyan:       #00d4ff;
+  --cyan-dim:   rgba(0,212,255,0.12);
+  --cyan-glow:  rgba(0,212,255,0.25);
+  --green:      #00ff88;
+  --green-dim:  rgba(0,255,136,0.10);
+  --amber:      #ffb547;
+  --amber-dim:  rgba(255,181,71,0.10);
+  --red:        #ff4757;
+  --red-dim:    rgba(255,71,87,0.10);
+  --mono:       'IBM Plex Mono', 'Fira Code', monospace;
+  --sans:       'Geist', 'Inter', system-ui, sans-serif;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100dvh;
+}
+
+#root {
+  width: 100%;
+  min-height: 100dvh;
+}
+
+/* ── scrollbars ── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 2px; }
+
+/* ── utility ── */
+.mono { font-family: var(--mono); }
+.tabular { font-variant-numeric: tabular-nums; }
+
+/* ── keyframes ── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes waveform-bar {
+  0%, 100% { transform: scaleY(0.15); }
+  50%       { transform: scaleY(1); }
+}
+@keyframes chart-line-draw {
+  from { stroke-dashoffset: 1000; }
+  to   { stroke-dashoffset: 0; }
+}

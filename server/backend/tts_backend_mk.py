@@ -315,13 +315,22 @@ class QwenTTSBackendMK:
     """
     Megakernel TTS backend — drop-in for QwenTTSBackendHF.
 
-    Strategy: monkey-patch talker.model.forward() to intercept after prefill,
-    copy HF KV cache into megakernel tensors, then run decode steps via megakernel.
+    Strategy: patch talker.model.generate() so each decode step uses the
+    megakernel instead of HF transformers. The generate() wrapper returns
+    the same tensor format HF expects, so code_predictor + vocoder run
+    unchanged downstream. This avoids the vocoder-API-discovery problem entirely.
 
-    KV cache layout compatibility confirmed:
+    Prefill flow:
+      1. HF calls talker.model(inputs_embeds=..., use_cache=True) for prefill
+         → we let that run normally via HF (gets past_key_values)
+      2. HF then calls talker.model.generate() for the decode loop
+         → we intercept: copy KV cache into megakernel tensors, run decode
+           steps via megakernel, return the token tensor to HF
+      3. HF passes the token tensor to code_predictor + vocoder as normal
+
+    KV cache layout compatibility confirmed (findings.md):
       HF:          list of 28 × (k[1,8,seq,128], v[1,8,seq,128])
       Megakernel:  [28, 8, MAX_SEQ_LEN, 128] pre-allocated, written in-place
-      → Layouts match. Just copy layer by layer.
     """
 
     def __init__(
@@ -352,100 +361,93 @@ class QwenTTSBackendMK:
         state = self._hf.model.state_dict()
         weights = _extract_talker_weights(state)
         self._decoder = _MKDecoder(weights)
+        # mk_decoder exposed for benchmark access
+        self.mk_decoder = self._decoder
 
         print(f"[QwenTTSBackendMK] Ready in {(time.perf_counter()-t0)*1000:.0f}ms")
 
     def _run_with_megakernel_decode(self, text: str) -> np.ndarray:
         """
-        Run prefill via HF, decode loop via megakernel.
+        Run generate_custom_voice with the talker decode loop replaced by megakernel.
 
-        Approach:
-        1. Hook talker.model.forward() to capture prefill output + KV cache
-        2. Let HF run one full forward pass (prefill only, no decode)
-        3. Copy KV cache to megakernel tensors
-        4. Run decode loop with megakernel until EOS
-        5. Run code_predictor + vocoder via HF on the resulting codec tokens
+        We patch talker.model.generate() so HF's pipeline calls our function
+        instead of its autoregressive generate loop. HF's generate() is only
+        called during the decode phase (after prefill), so patching it here
+        is safe — prefill runs via talker.model() forward pass as normal.
+
+        The patch function receives (input_ids, past_key_values, ...) from HF,
+        copies the KV cache into megakernel tensors, runs megakernel decode,
+        and returns a token_ids tensor in the shape HF expects.
         """
-        captured = {}
+        decoder = self._decoder
+        orig_generate = self._hf.model.talker.model.generate
 
-        orig_forward = self._hf.model.talker.model.forward
+        def _mk_generate(input_ids=None, past_key_values=None,
+                         max_new_tokens=4096, **kwargs):
+            # input_ids: [1, prefill_len] (last token after prefill)
+            # past_key_values: HF DynamicCache from prefill forward pass
+            if past_key_values is None:
+                # Fallback: no KV cache available — run HF normally
+                return orig_generate(
+                    input_ids=input_ids,
+                    past_key_values=past_key_values,
+                    max_new_tokens=max_new_tokens,
+                    **kwargs,
+                )
 
-        def _capture_prefill(*args, **kwargs):
-            # Only capture the first call (prefill) — restore after
-            self._hf.model.talker.model.forward = orig_forward
-            with torch.no_grad():
-                out = orig_forward(*args, **kwargs)
-            captured["past_key_values"] = out.past_key_values
-            captured["last_hidden"] = out.last_hidden_state[:, -1, :]  # [1, hidden]
-            return out
+            # Extract KV cache — DynamicCache exposes .key_cache / .value_cache
+            # or can be iterated as list of (k, v) tuples
+            try:
+                pkv_list = [
+                    (past_key_values.key_cache[i], past_key_values.value_cache[i])
+                    for i in range(len(past_key_values.key_cache))
+                ]
+            except AttributeError:
+                # Older pipecat/transformers: past_key_values is list of tuples
+                pkv_list = list(past_key_values)
 
-        self._hf.model.talker.model.forward = _capture_prefill
+            prefill_len = pkv_list[0][0].shape[2]
+            decoder.reset()
+            decoder.load_kv_cache_from_hf(pkv_list, prefill_len)
 
-        # Run one full HF generation to get the prefill KV cache
-        # We'll discard the HF decode output and re-run with megakernel
-        with torch.inference_mode():
-            hf_wavs, sr = self._hf.generate_custom_voice(
-                text=text,
-                language=self._language,
-                speaker=self._speaker,
-                max_new_tokens=1,   # just prefill + 1 token to get KV cache
-                do_sample=False,
-            )
+            # Get first decode token from input_ids (last prefill token)
+            first_token = int(input_ids[0, -1].item())
+            print(f"[MK] generate() intercepted — prefill={prefill_len}, first_tok={first_token}")
 
-        if "past_key_values" not in captured:
-            raise RuntimeError("Failed to capture prefill KV cache — hook did not fire")
+            # Megakernel decode loop
+            tokens = []
+            current_token = first_token
+            with torch.inference_mode():
+                for _ in range(max_new_tokens):
+                    next_token = decoder.step(current_token)
+                    if next_token == EOS_TOKEN_ID:
+                        break
+                    tokens.append(next_token)
+                    current_token = next_token
 
-        pkv = captured["past_key_values"]
-        prefill_len = pkv[0][0].shape[2]  # seq dim from first layer's k tensor
-        print(f"[MK] Prefill captured: {prefill_len} positions, {len(pkv)} layers")
+            print(f"[MK] Decoded {len(tokens)} codec tokens")
+            # Return shape [1, num_tokens] int64 — same as HF generate() output
+            return torch.tensor(tokens, dtype=torch.long, device="cuda").unsqueeze(0)
 
-        # Load HF KV cache into megakernel tensors
-        self._decoder.reset()
-        self._decoder.load_kv_cache_from_hf(pkv, prefill_len)
+        # Install patch, run, restore
+        self._hf.model.talker.model.generate = _mk_generate
+        try:
+            with torch.inference_mode():
+                wavs, sr = self._hf.generate_custom_voice(
+                    text=text,
+                    language=self._language,
+                    speaker=self._speaker,
+                    max_new_tokens=4096,
+                    do_sample=False,  # megakernel uses argmax internally
+                )
+        finally:
+            self._hf.model.talker.model.generate = orig_generate
 
-        # Get the first generated codec token from HF (position prefill_len)
-        # Then run decode loop with megakernel from there
-        # First token: project last_hidden through codec_head
-        last_hidden = captured["last_hidden"]  # [1, 1024]
-        with torch.no_grad():
-            logits = self._hf.model.talker.codec_head(last_hidden)  # [1, 3072]
-        first_token = int(logits.argmax(-1).item())
-        print(f"[MK] First codec token from prefill: {first_token}")
-
-        # Megakernel decode loop
-        codec_tokens = [first_token]
-        with torch.inference_mode():
-            for _ in range(4095):  # max steps
-                next_token = self._decoder.step(codec_tokens[-1])
-                if next_token == EOS_TOKEN_ID:
-                    break
-                codec_tokens.append(next_token)
-
-        print(f"[MK] Decoded {len(codec_tokens)} codec tokens")
-
-        # Run code_predictor + vocoder via HF on the codec tokens
-        # This uses the existing HF path — only talker decode was replaced
-        codec_tensor = torch.tensor(codec_tokens, dtype=torch.long, device="cuda").unsqueeze(0)
-        with torch.no_grad():
-            # Use HF's internal sub-talker to convert codec tokens → audio
-            # This mirrors what generate_custom_voice does after talker.generate()
-            talker_hidden = self._hf.model.talker.model.codec_embedding(codec_tensor)
-            # Run through code_predictor and vocoder
-            # NOTE: exact API depends on model internals — may need adjustment
-            codes, _ = self._hf.model.talker.forward_sub_talker(
-                input_ids=codec_tensor,
-                talker_hidden_states=talker_hidden[:, :, :],
-            )
-
-        # Decode codes to audio via HF vocoder
-        # (placeholder — vocoder call TBD from source inspection)
-        raise NotImplementedError(
-            "Vocoder call after megakernel decode not yet implemented. "
-            "Use _run_batch() fallback until this is wired."
-        )
+        audio = np.array(wavs[0], dtype=np.float32).squeeze()
+        return audio
 
     def _run_batch(self, text: str) -> np.ndarray:
-        """Full HF inference fallback."""
+        """Full HF inference fallback (no megakernel)."""
         wavs, sr = self._hf.generate_custom_voice(
             text=text,
             language=self._language,
@@ -461,10 +463,14 @@ class QwenTTSBackendMK:
     ) -> AsyncGenerator[tuple[bytes, int], None]:
         """
         Yields (audio_bytes: bytes, sample_rate: int) in ~100ms chunks.
-        Falls back to full HF until vocoder wiring is complete.
+        Uses megakernel decode if available; falls back to HF on error.
         """
         loop = asyncio.get_event_loop()
-        audio = await loop.run_in_executor(None, self._run_batch, text)
+        try:
+            audio = await loop.run_in_executor(None, self._run_with_megakernel_decode, text)
+        except Exception as e:
+            print(f"[QwenTTSBackendMK] Megakernel decode failed ({e}), falling back to HF")
+            audio = await loop.run_in_executor(None, self._run_batch, text)
 
         chunk_samples = int(self.sample_rate * 100 / 1000)
         for i in range(0, len(audio), chunk_samples):
