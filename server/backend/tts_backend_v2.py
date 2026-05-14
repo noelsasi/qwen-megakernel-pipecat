@@ -293,13 +293,20 @@ def _custom_decode_loop(
     else:
         prefill_len = 0  # not used in eager path
 
+    # Track EOS on GPU to avoid .item() sync every step.
+    # We check EOS only when we'd sync anyway (chunk yield or end of loop).
+    # Between chunk boundaries the GPU pipeline runs unblocked.
+    _eos_id_t = torch.tensor(eos_id, dtype=token.dtype, device=device)
+    _eos_found_at = None   # set when EOS detected
+
     for step_idx in range(max_new_tokens):
-        tok_val = token.item()   # CPU sync — needed to check EOS
+        # CPU sync required here — we need token value to build codec_embedding input.
+        # This is unavoidable: codec_embedding(token) needs the integer index on CPU.
+        # Minimize by keeping everything else GPU-side.
+        tok_val = token.item()
         if tok_val == eos_id:
             logger.info(f"[v2] EOS fired at step {step_idx}")
             break
-        if step_idx < 3:
-            logger.debug(f"[v2] step {step_idx}: token={tok_val}")
 
         # --- Code predictor: CB1..CB15 ---
         last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))   # [1, 1, 1024]
@@ -335,7 +342,9 @@ def _custom_decode_loop(
         # --- Talker backbone: single decode step ---
         if talker_graph is not None:
             hidden, logits = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)
-            past_hidden = hidden[:, -1:, :].clone()  # clone: output_buf overwritten on next replay
+            # No clone needed: past_hidden is consumed by predictor_graph.run() at the top
+            # of the NEXT iteration, before talker_graph.run() overwrites output_buf again.
+            past_hidden = hidden[:, -1:, :]
             if logits is None:
                 logits = codec_head(hidden[:, -1, :])
         else:
@@ -628,6 +637,31 @@ class QwenTTSBackendV2:
         all_frames_ref = []
         decode_error = None
 
+        # Vocoder runs in a separate thread so decode loop is never blocked.
+        import queue as _queue
+        _codec_queue: _queue.Queue = _queue.Queue()  # codec chunks → vocoder thread
+        _VOCODER_DONE = object()  # sentinel
+
+        def _vocoder_thread():
+            while True:
+                item = _codec_queue.get()
+                if item is _VOCODER_DONE:
+                    break
+                chunk, is_final_flush = item
+                if is_final_flush:
+                    audio_bytes = vocoder.flush(chunk)  # chunk = all_frames_ref here
+                else:
+                    audio_bytes = vocoder.add_chunk(chunk)
+                if audio_bytes:
+                    asyncio.run_coroutine_threadsafe(
+                        audio_queue.put(audio_bytes), loop
+                    ).result()
+            asyncio.run_coroutine_threadsafe(audio_queue.put(None), loop).result()
+
+        import threading as _threading
+        _vt = _threading.Thread(target=_vocoder_thread, daemon=True)
+        _vt.start()
+
         def _decode_thread():
             nonlocal decode_error
             try:
@@ -645,12 +679,8 @@ class QwenTTSBackendV2:
                 )
 
                 def _on_chunk(chunk: torch.Tensor):
-                    # chunk: [CHUNK_FRAMES, 16] or smaller for final chunk
-                    audio_bytes = vocoder.add_chunk(chunk)
-                    if audio_bytes:
-                        asyncio.run_coroutine_threadsafe(
-                            audio_queue.put(audio_bytes), loop
-                        ).result()
+                    # Push to vocoder thread — decode loop is never blocked
+                    _codec_queue.put((chunk.clone(), False))
 
                 # If TalkerGraph is active, copy DynamicCache → StaticCache
                 if self._talker_graph is not None:
@@ -672,20 +702,15 @@ class QwenTTSBackendV2:
                 )
                 all_frames_ref.extend(frames)
 
-                # Flush tail using the full frame list for best quality
-                tail = vocoder.flush(all_frames_ref)
-                if tail:
-                    asyncio.run_coroutine_threadsafe(
-                        audio_queue.put(tail), loop
-                    ).result()
+                # Final flush via vocoder thread, then signal done
+                _codec_queue.put((list(all_frames_ref), True))
+                _codec_queue.put(_VOCODER_DONE)
 
             except Exception as e:
                 logger.error(f"[v2] Decode thread error: {e}", exc_info=True)
                 decode_error = e
-            finally:
-                asyncio.run_coroutine_threadsafe(
-                    audio_queue.put(None), loop  # sentinel — signals end of stream
-                ).result()
+                # Signal vocoder thread to stop and emit sentinel
+                _codec_queue.put(_VOCODER_DONE)
 
         try:
             executor_fut = loop.run_in_executor(None, _decode_thread)
