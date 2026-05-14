@@ -454,7 +454,14 @@ class QwenTTSBackendMK:
             next_token = decoder.step(current_token)
             _step_count[0] += 1
 
-            # Tell HF the next token via one-hot logits so it embeds the right token
+            if _step_count[0] <= 3:
+                print(f"[MK] step {_step_count[0]}: {current_token} -> {next_token}")
+
+            # If EOS, signal it via logits so HF stops
+            if next_token == EOS_TOKEN_ID or _step_count[0] >= 2048:
+                print(f"[MK] EOS at step {_step_count[0]}, token={next_token}")
+                next_token = EOS_TOKEN_ID
+
             _current_token[0] = next_token
 
             logits = torch.zeros(1, 1, VOCAB_SIZE, dtype=torch.bfloat16, device="cuda")
