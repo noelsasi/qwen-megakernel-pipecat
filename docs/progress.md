@@ -58,14 +58,16 @@ RTF 0.879 means the model generates audio almost in real-time but NOT faster —
 
 - [ ] **Phase B** — Real streaming: hook `generate()` internals to yield audio chunks before full generation completes (reduces TTFC)
 - [ ] **Phase C** — Pipecat pipeline end-to-end (STT → LLM → TTS → speaker)
-- [ ] **Phase D** — Megakernel: patch kernel.cu (VOCAB_SIZE), build, wire decode loop
+- [ ] **Phase D** — Megakernel integration
   - [x] Clone megakernel repo
-  - [x] Compat matrix complete — only 2 constant changes needed + MRope tables
+  - [x] Compat matrix complete — HEAD_DIM=128 ✅, NUM_HEADS=16 ✅, only VOCAB_SIZE wrong
   - [x] Weight extraction code written (tts_backend_mk.py)
-  - [x] MRope cos/sin table builder written
-  - [ ] Patch kernel.cu: `LDG_VOCAB_SIZE 151936 → 3072`
-  - [ ] Build megakernel: `cd qwen_megakernel && pip install -e .`
-  - [ ] Wire prefill handoff: HF prefill → megakernel decode loop
-  - [ ] Validate output matches HF baseline (same audio)
+  - [x] MRope cos/sin table builder written (interleaved, theta=1e6)
+  - [x] Patch kernel.cu: `LDG_VOCAB_SIZE 151936 → 3072` ✅
+  - [x] JIT build succeeds (`qwen_megakernel_C.so`) ✅
+  - [x] Single decode step works: `step(0) → token 112` ✅
+  - [ ] **BLOCKER:** Prefill uses mixed `inputs_embeds` (text + codec + speaker) — megakernel only accepts integer token IDs. Cannot directly hand off after HF prefill.
+  - [ ] Investigate Option A: monkey-patch talker.model.forward() post-prefill
+  - [ ] Fallback: flash-attn baseline + document integration blocker honestly
 - [ ] flash-attn install — likely gives meaningful speedup on RTX 5090
 - [ ] HF_TOKEN set on server (currently unauthenticated — hitting rate limits)

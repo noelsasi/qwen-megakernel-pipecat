@@ -223,11 +223,58 @@ Source: `qwen_megakernel/csrc/kernel.cu` (confirmed from source) vs model config
 
 ---
 
+## Phase D Integration — Critical Blocker (2026-05-14)
+
+### The Prefill Incompatibility Problem
+
+The megakernel's `decode` op signature:
+```
+decode(output_token, input_token_id, embed_weight, ...)
+```
+It takes an **integer token ID** and does its own embedding lookup via `codec_embedding`.
+
+The HF talker's prefill constructs `inputs_embeds` — a **mixed float tensor** combining:
+- Text token projections via `text_projection` MLP
+- Codec special token embeddings (codec_think_id, codec_bos_id, language_id, etc.)
+- Speaker embeddings (if provided)
+- Padding embeddings
+- `trailing_text_hiddens` (text continuation)
+
+These are concatenated and passed to `self.talker.generate(inputs_embeds=...)`. The megakernel has no way to accept this mixed embedding — it only understands integer codec token IDs.
+
+**Consequence:** The megakernel cannot replace the prefill. The prefill must always run via HF.
+
+### What the Megakernel CAN Replace
+
+The decode loop inside `self.talker.generate()` autoregressively generates codec tokens one at a time. After the prefill KV cache is established, each decode step takes the previous codec token ID and produces the next one — **this** is the hot loop. But:
+
+1. HF's `generate()` method runs prefill + decode as one atomic call — no exposed hook to intercept between them
+2. The talker's `generate()` is called with `inputs_embeds` not `input_ids` — HF generate doesn't support splitting prefill/decode when `inputs_embeds` is used
+3. `trailing_text_hidden` is a custom kwarg unique to this model — further complicates any monkey-patching
+
+### Viable Paths Forward
+
+**Option A — Monkey-patch talker.model.forward():**
+Replace the inner transformer forward pass with a megakernel call after the KV cache is populated. Requires:
+- Intercepting after the first forward pass (prefill)
+- Reading the KV cache from HF tensors and writing them to megakernel's cache format
+- Running subsequent steps via megakernel decode op
+- Risk: KV cache format may differ (head ordering, layout)
+
+**Option B — Replace only the transformer layers with custom CUDA kernels:**
+Keep HF generate() but replace the attention+MLP compute with megakernel ops. Requires hooking into each layer's forward() — very complex.
+
+**Option C — Pure HF with flash-attn (pragmatic):**
+Skip megakernel decode loop integration. Install flash-attn, benchmark improvement. Document why full megakernel integration is blocked by the prefill embedding incompatibility. This is honest and shippable.
+
+**Option D — Rewrite generate() from scratch:**
+Implement the full prefill + decode loop manually in Python, handling the mixed embeddings for prefill then switching to megakernel for decode. Very high effort but technically correct.
+
+**Recommended path:** Option A (monkey-patch) + Option C as fallback if A fails. Document everything honestly.
+
 ## Open Questions
 
 1. **EOS token** — confirmed as 2150 from `pad_token_id` warning ✅
 2. **Sample rate** — confirmed 24000 Hz ✅ ("12Hz" in model name = codec frame rate)
-3. **Streaming internals** — `generate_custom_voice()` is blocking; need to hook internal `generate()` to get per-chunk audio for real TTFC measurement (Phase B)
-4. **MRope in megakernel** — does `kernel.cu` have any MRope code, or is it purely standard RoPE? (Phase D.1)
-5. **Weight key names** — what keys does `qwen_megakernel/model.py` expect vs `model.model.state_dict()` keys? (Phase D.2)
-6. **flash-attn impact** — how much does installing flash-attn improve RTF on RTX 5090? Worth measuring before megakernel.
+3. **KV cache format** — does HF talker's past_key_values layout match megakernel's [NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM]? (needed for Option A)
+4. **flash-attn impact** — how much does installing flash-attn improve RTF on RTX 5090?
