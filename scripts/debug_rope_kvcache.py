@@ -127,15 +127,13 @@ if k_raw is not None:
         sin_1 = torch.sin(inv_freq * 1.0).cuda()   # [64]
 
         # Test adjacent-pair: cached[2i] = raw[2i]*cos[i] - raw[2i+1]*sin[i]
-        adj_recon = torch.zeros(HEAD_DIM)
+        adj_recon = torch.zeros(HEAD_DIM, device="cuda")
         for i in range(half):
             adj_recon[2*i]   = raw_h0_p1[2*i]   * cos_1[i] - raw_h0_p1[2*i+1] * sin_1[i]
             adj_recon[2*i+1] = raw_h0_p1[2*i+1] * cos_1[i] + raw_h0_p1[2*i]   * sin_1[i]
 
         # Test split-half: cached[i] = raw[i]*cos[i] - raw[i+half]*sin[i]
-        split_recon = torch.zeros(HEAD_DIM)
-        cos_full = torch.cat([cos_1, cos_1])
-        sin_full = torch.cat([sin_1, sin_1])
+        split_recon = torch.zeros(HEAD_DIM, device="cuda")
         split_recon[:half] = raw_h0_p1[:half] * cos_1 - raw_h0_p1[half:] * sin_1
         split_recon[half:] = raw_h0_p1[half:] * cos_1 + raw_h0_p1[:half] * sin_1
 
