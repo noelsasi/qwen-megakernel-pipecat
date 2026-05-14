@@ -119,22 +119,38 @@ model
 
 ## Megakernel Compatibility Matrix
 
-Source: `qwen_megakernel/csrc/kernel.cu` (expected defaults) vs confirmed model values.
+Source: `qwen_megakernel/csrc/kernel.cu` (confirmed from source) vs model config.
 
-| Parameter | Megakernel default | Model actual | Match? | Action |
-|-----------|-------------------|--------------|--------|--------|
-| `NUM_LAYERS` | 28 | 28 | ✅ | — |
+| Parameter | Megakernel (kernel.cu) | Model actual | Match? | Action |
+|-----------|----------------------|--------------|--------|--------|
+| `NUM_Q_HEADS` | 16 | 16 | ✅ | — |
+| `NUM_KV_HEADS` | 8 | 8 | ✅ | — |
 | `HIDDEN_SIZE` | 1024 | 1024 | ✅ | — |
 | `INTERMEDIATE_SIZE` | 3072 | 3072 | ✅ | — |
-| `NUM_HEADS` | 32 | **16** | ❌ | Change to 16 |
-| `NUM_KV_HEADS` | 8 | 8 | ✅ | — |
-| `HEAD_DIM` | 128 | 64 (=1024/16) | ❌ | Change to 64 |
-| `VOCAB_SIZE` | 151936 | **3072** | ❌ | Change to 3072 |
-| `MAX_SEQ_LEN` | 2048 | **32768** | ❌ | Increase |
-| `rope_theta` | unknown | 1,000,000 | ? | Verify in kernel.cu |
-| RoPE type | standard | **interleaved MRope** | ❌ | Critical — needs MRope impl |
+| `LDG_RMS_EPS` | 1e-6 | 1e-6 | ✅ | — |
+| `HEAD_DIM` | **128** | **64** (=1024/16) | ❌ | Change to 64; ripples into Q_SIZE, KV_SIZE |
+| `LDG_VOCAB_SIZE` | **151936** | **3072** | ❌ | Change to 3072 |
+| `Q_SIZE` | 16×128=2048 | 16×64=1024 | ❌ | Derived — fixed when HEAD_DIM fixed |
+| `KV_SIZE` | 8×128=1024 | 8×64=512 | ❌ | Derived — fixed when HEAD_DIM fixed |
+| NUM_LAYERS | not found yet | 28 | ? | Verify in source |
+| rope_theta | not found yet | 1,000,000 | ? | Verify in source |
+| RoPE type | **standard RoPE only** | **interleaved MRope** | ❌ | Critical — needs new impl |
 
-> `HEAD_DIM = HIDDEN_SIZE / NUM_HEADS = 1024 / 16 = 64` (not 128 as megakernel assumes)
+> `HEAD_DIM = HIDDEN_SIZE / NUM_Q_HEADS = 1024 / 16 = 64`  
+> The kernel was written for Qwen3-0.6B text model (HEAD_DIM=128, VOCAB=151936).  
+> The TTS talker has the same layer structure but different HEAD_DIM and vocab.
+
+**Confirmed mismatches requiring kernel changes:**
+1. `HEAD_DIM 128 → 64` — all attention buffer sizing must be recalculated
+2. `LDG_VOCAB_SIZE 151936 → 3072` — LM head output projection size
+3. `Q_SIZE / KV_SIZE` — derived, auto-fixed when HEAD_DIM changes
+4. **Interleaved MRope** — standard RoPE in kernel must be replaced (see RoPE section below)
+
+**RoPE situation (critical):**
+- Kernel has standard RoPE only (grep confirms: no `mrope`, no `interleave`, no `mrope_section`)
+- Talker uses interleaved MRope with sections [24, 20, 20] and theta=1,000,000
+- MRope applies different rotation frequencies to different slices of each head dimension
+- This is not a constant change — requires rewriting the RoPE block in the kernel
 
 **Summary:** 5 confirmed mismatches, 1 critical (MRope). Simple `#define` changes fix 4 of them. MRope requires actual kernel code changes.
 
