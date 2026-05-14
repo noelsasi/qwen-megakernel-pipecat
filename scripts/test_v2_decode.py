@@ -280,6 +280,12 @@ def stage4_vocoder(backend, frames):
 
 async def stage5_streaming_ttfc(backend):
     logger.info("=== STAGE 5: Streaming TTFC measurement ===")
+    # Warmup: drain one full synthesis to trigger torch.compile + GPU warmup
+    # before measuring. Otherwise first call includes compile latency.
+    logger.info("  Warming up (1 synthesis to trigger compile)...")
+    async for _ in backend.synthesize_streaming("Warmup."):
+        pass
+    logger.info("  Warmup done. Measuring now...")
     t_start = time.perf_counter()
     t_first = None
     total_samples = 0

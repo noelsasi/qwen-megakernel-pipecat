@@ -27,6 +27,7 @@ This is a new isolated module. Wire it in by setting TTS_BACKEND=v2 in voice_age
 """
 
 import asyncio
+import os
 import sys
 import time
 import logging
@@ -247,7 +248,7 @@ def _custom_decode_loop(
         pred_input: [1, 2, hidden] = cat(past_hidden, last_id_hidden)
         """
         cb_tokens = []
-        # Prefill: 2-token sequence through 5-layer predictor
+        # Prefill: 2-token sequence through 5-layer predictor, build KV cache
         pred_out = pred_model(inputs_embeds=pred_input, use_cache=True, return_dict=True)
         pred_pkv = pred_out.past_key_values
         cb_logits = pred_lm_heads[0](pred_out.last_hidden_state[:, -1, :])
@@ -255,6 +256,7 @@ def _custom_decode_loop(
                   if do_sample and temperature > 0 else cb_logits.argmax(-1).squeeze())
         cb_tokens.append(cb_tok)
 
+        # Steps CB2..CB15: single-token decode with KV cache
         for cb_idx in range(1, num_code_groups - 1):
             cb_emb = pred_embeds[cb_idx - 1](cb_tok.unsqueeze(0).unsqueeze(0))
             pred_out = pred_model(inputs_embeds=cb_emb, past_key_values=pred_pkv,
@@ -494,6 +496,20 @@ class QwenTTSBackendV2:
         self._talker = model.talker
         self._config = model.talker.config
         self._speech_tokenizer = model.speech_tokenizer
+
+        # torch.compile for kernel fusion — set V2_COMPILE=0 to disable
+        if os.environ.get("V2_COMPILE", "1") != "0":
+            logger.info("[v2] Applying torch.compile (set V2_COMPILE=0 to skip)...")
+            try:
+                model.talker.model = torch.compile(
+                    model.talker.model, mode="reduce-overhead", fullgraph=False
+                )
+                model.talker.code_predictor.model = torch.compile(
+                    model.talker.code_predictor.model, mode="reduce-overhead", fullgraph=False
+                )
+                logger.info("[v2] torch.compile applied")
+            except Exception as e:
+                logger.warning(f"[v2] torch.compile failed ({e}), running uncompiled")
 
         logger.info(f"[v2] Ready in {(time.perf_counter()-t0)*1000:.0f}ms")
         logger.info(f"[v2] num_code_groups={self._config.num_code_groups}, vocab_size={self._config.vocab_size}")
