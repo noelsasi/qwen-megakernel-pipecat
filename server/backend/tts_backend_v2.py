@@ -272,10 +272,14 @@ def _custom_decode_loop(
             output_hidden_states=False,
             return_dict_in_generate=True,
         )
-        # sequences: [1, input_len + num_code_groups-1] — slice off the input prefix
-        seq = predictor_result.sequences[0]   # [input_len + 15]
-        input_len = pred_input.shape[1]       # = 2
-        codebook_token_ids = seq[input_len:]  # [15] — CB1..CB15
+        # sequences shape: [1, total_len]. With inputs_embeds HF may or may not
+        # include a prefix — take the last (num_code_groups-1) tokens which are
+        # always the generated CB1..CB15 regardless of prefix length.
+        seq = predictor_result.sequences[0]              # [total_len]
+        n_generated = num_code_groups - 1               # 15
+        codebook_token_ids = seq[-n_generated:]         # [15] — CB1..CB15
+        if step_idx == 0:
+            logger.debug(f"[v2] predictor seq len={len(seq)}, taking last {n_generated}: {codebook_token_ids.tolist()}")
 
         # Full codec frame: CB0 + CB1..CB15
         all_cb = torch.cat([token.view(1), codebook_token_ids])   # [16]
