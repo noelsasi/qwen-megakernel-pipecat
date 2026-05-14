@@ -173,12 +173,25 @@ def _pack_layer_weights(layer_weights: list) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class _MKDecoder:
-    """Stateful single-token decoder using the CUDA megakernel."""
+    """
+    Stateful single-token decoder using the CUDA megakernel.
+
+    Confirmed ops from torch_bindings.cpp:
+      decode(output_token, input_token_id, embed_weight, layer_weights_packed,
+             final_norm_weight, lm_head_weight, cos_table, sin_table,
+             k_cache, v_cache, hidden_buffer, activations, residual,
+             q, k, v, attn_out, mlp_intermediate, normalized,
+             block_max_vals, block_max_idxs,
+             num_layers, position, max_seq_len, attn_scale) -> ()
+
+      generate_nosync(first_token_id, num_steps, ..same buffers..,
+                      num_layers, start_position, max_seq_len, attn_scale) -> Tensor[num_steps]
+    """
 
     def __init__(self, weights: dict):
         self._weights = weights  # keep references — prevents GC of GPU tensors
         self._position = 0
-        self._attn_scale = HEAD_DIM ** -0.5
+        self._attn_scale = float(HEAD_DIM ** -0.5)
 
         self._cos_table, self._sin_table = _build_mrope_tables()
         self._embed_weight = weights["embed_weight"]
@@ -186,16 +199,16 @@ class _MKDecoder:
         self._lm_head_weight = weights["lm_head_weight"]
         self._layer_weights_packed = _pack_layer_weights(weights["layer_weights"])
 
-        # Working buffers
+        # Working buffers (exact names match torch_bindings.cpp parameter names)
         self._hidden = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        self._act = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        self._res = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._activations = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._residual = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
         self._q = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         self._k = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         self._v = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         self._attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        self._mlp_inter = torch.zeros(HIDDEN_SIZE * 2, dtype=torch.bfloat16, device="cuda")
-        self._norm_out = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._mlp_intermediate = torch.zeros(HIDDEN_SIZE * 2, dtype=torch.bfloat16, device="cuda")
+        self._normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
         self._k_cache = torch.zeros(
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.bfloat16, device="cuda",
@@ -204,17 +217,19 @@ class _MKDecoder:
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.bfloat16, device="cuda",
         )
-        n_attn = NUM_Q_HEADS
-        self._bmax_vals = torch.full((n_attn,), float("-inf"), device="cuda")
-        self._bmax_idxs = torch.zeros(n_attn, dtype=torch.int32, device="cuda")
-        self._d_position = torch.zeros(1, dtype=torch.int32, device="cuda")
+        # block_max_vals/idxs: one entry per attention block (LDG_ATTN_BLOCKS=8 from build.py)
+        n_attn_blocks = 8
+        self._block_max_vals = torch.full((n_attn_blocks,), float("-inf"), dtype=torch.float32, device="cuda")
+        self._block_max_idxs = torch.zeros(n_attn_blocks, dtype=torch.int32, device="cuda")
+        # output_token: single int32 tensor written by decode op
+        self._output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
 
-        self._step_fn = torch.ops.qwen_megakernel_C.step
+        self._decode_op = torch.ops.qwen_megakernel_C.decode
+        self._generate_op = torch.ops.qwen_megakernel_C.generate_nosync
 
-    def step(self, token_id: int) -> int:
-        self._d_position[0] = self._position
-        self._step_fn(
-            token_id,
+    def _call_args(self):
+        """Common buffer args shared by decode and generate_nosync."""
+        return (
             self._embed_weight,
             self._layer_weights_packed,
             self._final_norm_weight,
@@ -224,34 +239,52 @@ class _MKDecoder:
             self._k_cache,
             self._v_cache,
             self._hidden,
-            self._act,
-            self._res,
+            self._activations,
+            self._residual,
             self._q,
             self._k,
             self._v,
             self._attn_out,
-            self._mlp_inter,
-            self._norm_out,
-            self._bmax_vals,
-            self._bmax_idxs,
+            self._mlp_intermediate,
+            self._normalized,
+            self._block_max_vals,
+            self._block_max_idxs,
+        )
+
+    def step(self, token_id: int) -> int:
+        """Run one decode step. Returns next token id."""
+        self._decode_op(
+            self._output_token,
+            token_id,
+            *self._call_args(),
             NUM_LAYERS,
-            self._d_position,
+            self._position,   # plain int
             MAX_SEQ_LEN,
             self._attn_scale,
         )
         self._position += 1
-        # Output token is the argmax of lm_head(norm_out)
-        # The kernel writes logits into a buffer — read from norm_out and project
-        with torch.no_grad():
-            logits = self._norm_out.float() @ self._lm_head_weight.float().T
-        return int(logits.argmax().item())
+        return int(self._output_token.item())
+
+    def generate_n(self, first_token_id: int, num_steps: int) -> list[int]:
+        """Run num_steps decode steps without sync. Returns list of token ids."""
+        output = self._generate_op(
+            first_token_id,
+            num_steps,
+            *self._call_args(),
+            NUM_LAYERS,
+            self._position,   # start_position
+            MAX_SEQ_LEN,
+            self._attn_scale,
+        )
+        self._position += num_steps
+        return output.cpu().tolist()
 
     def reset(self):
         self._position = 0
         self._k_cache.zero_()
         self._v_cache.zero_()
-        self._bmax_vals.fill_(float("-inf"))
-        self._bmax_idxs.zero_()
+        self._block_max_vals.fill_(float("-inf"))
+        self._block_max_idxs.zero_()
 
 
 # ---------------------------------------------------------------------------
