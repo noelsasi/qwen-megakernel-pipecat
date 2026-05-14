@@ -51,28 +51,24 @@ def step3_load_and_inspect():
     print("=" * 60)
 
     import torch
-    # qwen3_tts is a separate package — install with: pip install -U qwen-tts
-    from qwen_tts.core.models import Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+    # Use the high-level Qwen3TTSModel wrapper — handles tokenization internally
+    from qwen_tts import Qwen3TTSModel
 
-    print("Loading via qwen_tts package ...")
+    print("Loading via Qwen3TTSModel (high-level API) ...")
     try:
-        model = Qwen3TTSForConditionalGeneration.from_pretrained(
+        model = Qwen3TTSModel.from_pretrained(
             MODEL_ID,
             device_map="cpu",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
         print(f"Loaded as: {type(model).__name__}")
+        print(f"Supported speakers: {list(model.get_supported_speakers())}")
     except Exception as e:
         print(f"Load failed: {e}")
         print("STOP: Run: pip install -U qwen-tts")
         sys.exit(1)
 
-    try:
-        processor = Qwen3TTSProcessor.from_pretrained(MODEL_ID)
-        print(f"Processor loaded: {type(processor).__name__}")
-    except Exception as e:
-        print(f"Processor load failed: {e}")
-        processor = None
+    processor = None  # tokenization is internal to Qwen3TTSModel
 
     print("\n--- NAMED MODULES ---")
     for name, module in model.named_modules():
@@ -89,13 +85,20 @@ def step3_load_and_inspect():
             if hasattr(val, "__class__") and "Module" in type(val).__name__:
                 print(f"  model.{attr}: {type(val).__name__}")
 
-    print("\n--- generate() SIGNATURE ---")
+    print("\n--- generate_custom_voice() SIGNATURE ---")
     import inspect
     try:
-        sig = inspect.signature(model.generate)
-        print(f"  model.generate{sig}")
+        sig = inspect.signature(model.generate_custom_voice)
+        print(f"  model.generate_custom_voice{sig}")
     except Exception:
-        print("  No generate() method or can't inspect signature")
+        print("  No generate_custom_voice() method")
+
+    print("\n--- internal generate() SIGNATURE (on model.model) ---")
+    try:
+        sig = inspect.signature(model.model.generate)
+        print(f"  model.model.generate{sig}")
+    except Exception:
+        print("  Not accessible")
 
     print("\n--- MODEL CONFIG ---")
     try:

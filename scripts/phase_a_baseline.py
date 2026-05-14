@@ -1,12 +1,17 @@
 """
 Phase A.4 — Baseline TTS to WAV file with latency measurements.
 
-Run AFTER phase_a_inspect_model.py has confirmed the correct class/API.
-Update MODEL_CLASS and LOAD_KWARGS based on inspect output.
+Confirmed API (from QwenLM/Qwen3-TTS repo + source inspection):
+  - Use Qwen3TTSModel (high-level wrapper), NOT Qwen3TTSForConditionalGeneration directly
+  - Call model.generate_custom_voice() — handles tokenization internally
+  - Speaker must be one of: Ryan, Aiden (English), Vivian, Serena, Uncle_Fu,
+    Dylan, Eric (Chinese), Ono_Anna (Japanese), Sohee (Korean)
+  - Sample rate returned by the model is 12000 Hz (12Hz tokenizer)
+  - Returns (wavs: list[np.ndarray], sr: int)
 
 Usage:
-    python scripts/phase_a_baseline.py --text "Hello, this is a test."
-    python scripts/phase_a_baseline.py  # uses default text
+    python scripts/phase_a_baseline.py
+    python scripts/phase_a_baseline.py --text "Hello world" --speaker Ryan
 """
 
 import argparse
@@ -19,100 +24,73 @@ import torch
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 DEFAULT_TEXT = "Hello, this is a test of the Qwen TTS system. The quick brown fox jumps over the lazy dog."
 OUTPUT_PATH = "output_baseline.wav"
+DEFAULT_SPEAKER = "Ryan"
+DEFAULT_LANGUAGE = "English"
 
 
 def load_model():
-    from qwen_tts.core.models import Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+    from qwen_tts import Qwen3TTSModel
 
     print(f"Loading model: {MODEL_ID}")
     t0 = time.perf_counter()
 
-    model = Qwen3TTSForConditionalGeneration.from_pretrained(
+    model = Qwen3TTSModel.from_pretrained(
         MODEL_ID,
         device_map="cuda",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
-    model.eval()
-
-    processor = Qwen3TTSProcessor.from_pretrained(MODEL_ID)
 
     load_ms = (time.perf_counter() - t0) * 1000
     print(f"Model load: {load_ms:.0f}ms")
     print(f"Model type: {type(model).__name__}")
+    print(f"Supported speakers: {list(model.get_supported_speakers())}")
 
-    return model, processor
-
-
-SAMPLE_RATE = 24000  # confirmed from model card; position_id_per_seconds=13 → ~13 frames/sec
+    return model
 
 
-def run_inference(model, processor, text: str):
+def run_inference(model, text: str, speaker: str, language: str):
     """
     Run single non-streaming inference. Returns (audio_np, sample_rate, gen_ms).
-
-    generate() signature (confirmed from inspection):
-      input_ids, instruct_ids, ref_ids, voice_clone_prompt, languages, speakers,
-      non_streaming_mode, max_new_tokens, do_sample, top_k, top_p, temperature,
-      subtalker_dosample, subtalker_top_k, subtalker_top_p, subtalker_temperature,
-      eos_token_id, repetition_penalty
     """
-    input_ids = processor(text, return_tensors="pt").input_ids.to(model.device)
-    # languages and speakers must be lists matching len(input_ids) — cannot be None
-    batch_input_ids = [input_ids[0]]
-    languages = ["English"]   # may need to be "en" — check if this errors
-    speakers = [None]         # None = no specific speaker (model auto-assigns)
-
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    with torch.inference_mode():
-        outputs = model.generate(
-            input_ids=batch_input_ids,
-            languages=languages,
-            speakers=speakers,
-            non_streaming_mode=True,
-            max_new_tokens=4096,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
-            repetition_penalty=1.05,
-        )
+    wavs, sr = model.generate_custom_voice(
+        text=text,
+        language=language,
+        speaker=speaker,
+        max_new_tokens=4096,
+        do_sample=True,
+        temperature=0.9,
+        top_k=50,
+        top_p=1.0,
+    )
 
     torch.cuda.synchronize()
     gen_ms = (time.perf_counter() - t0) * 1000
 
-    # outputs is a list of audio tensors (one per batch item)
-    if isinstance(outputs, (list, tuple)):
-        audio = outputs[0]
-    else:
-        audio = outputs
-
+    audio = wavs[0]  # first (only) batch item
     if isinstance(audio, torch.Tensor):
         audio = audio.cpu().float().numpy()
+    audio = np.array(audio, dtype=np.float32).squeeze()
 
-    audio = audio.squeeze()
-    return audio, SAMPLE_RATE, gen_ms
+    return audio, sr, gen_ms
 
 
-def warmup(model, processor):
+def warmup(model, speaker, language):
     print("Warming up (first inference compiles CUDA ops) ...")
-    try:
-        run_inference(model, processor, "warmup")
-        torch.cuda.synchronize()
-        print("Warmup done.")
-    except Exception as e:
-        print(f"Warmup failed (may be API mismatch — check inspect output): {e}")
-        raise
+    run_inference(model, "warmup test", speaker, language)
+    torch.cuda.synchronize()
+    print("Warmup done.")
 
 
-def benchmark(model, processor, text: str, trials: int = 5):
-    print(f"\nBenchmarking {trials} trials:")
+def benchmark(model, text: str, speaker: str, language: str, trials: int = 5):
+    print(f"\nBenchmarking {trials} trials | speaker={speaker} | language={language}")
     gen_times = []
     last_audio, last_sr = None, None
 
     for i in range(trials):
-        audio, sr, gen_ms = run_inference(model, processor, text)
+        audio, sr, gen_ms = run_inference(model, text, speaker, language)
         gen_times.append(gen_ms)
         last_audio, last_sr = audio, sr
         audio_ms = len(audio) / sr * 1000
@@ -127,16 +105,19 @@ def benchmark(model, processor, text: str, trials: int = 5):
     print(f"\nResults (mean ± std over {trials} trials):")
     print(f"  Generation time: {mean:.0f} ± {std:.0f} ms")
     print(f"  Audio duration:  {audio_ms:.0f} ms")
+    print(f"  Sample rate:     {last_sr} Hz")
     print(f"  RTF:             {rtf:.3f}")
     print(f"  Target RTF < 0.15: {'PASS' if rtf < 0.15 else 'FAIL'}")
 
-    return last_audio, last_sr, mean, rtf
+    return last_audio, last_sr, mean, std, rtf
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--text", default=DEFAULT_TEXT)
     parser.add_argument("--output", default=OUTPUT_PATH)
+    parser.add_argument("--speaker", default=DEFAULT_SPEAKER)
+    parser.add_argument("--language", default=DEFAULT_LANGUAGE)
     parser.add_argument("--trials", type=int, default=5)
     args = parser.parse_args()
 
@@ -144,14 +125,16 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    model, processor = load_model()
-    warmup(model, processor)
+    model = load_model()
+    warmup(model, args.speaker, args.language)
 
-    audio, sr, gen_mean, rtf = benchmark(model, processor, args.text, trials=args.trials)
+    audio, sr, gen_mean, gen_std, rtf = benchmark(
+        model, args.text, args.speaker, args.language, trials=args.trials
+    )
 
     sf.write(args.output, audio, sr)
     print(f"\nSaved: {args.output} (sr={sr}Hz)")
-    print("\nPhase A DONE — fill in compatibility_check.py with config values from inspect output.")
+    print("Phase A DONE.")
 
 
 if __name__ == "__main__":

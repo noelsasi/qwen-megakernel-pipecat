@@ -10,10 +10,12 @@
 | Finding | Value | Source |
 |---------|-------|--------|
 | pip package | `qwen-tts` (`pip install -U qwen-tts`) | Trial and error — NOT in transformers |
-| Model class | `Qwen3TTSForConditionalGeneration` | `qwen_tts.core.models` |
-| Processor class | `Qwen3TTSProcessor` | `qwen_tts.core.models` |
+| **High-level class** | `Qwen3TTSModel` from `qwen_tts` | Official repo — use this |
+| Low-level class | `Qwen3TTSForConditionalGeneration` from `qwen_tts.core.models` | Do NOT call directly |
+| No separate processor | Tokenization is internal to `Qwen3TTSModel` | Confirmed from source |
 | `model_type` in config | `qwen3_tts` | `config.json` |
 | HF model ID | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` | Model card |
+| **Sample rate** | **12000 Hz** (not 24000) | 12Hz tokenizer, returned by model |
 
 ---
 
@@ -63,36 +65,41 @@
 
 ---
 
-## generate() API (Confirmed from inspection)
+## generate() API (Corrected — use high-level wrapper)
+
+**Do NOT call `model.generate()` directly.** Use the high-level wrapper methods:
 
 ```python
-model.generate(
-    input_ids: list[torch.Tensor],   # list of 1D tensors, one per batch item
-    instruct_ids: list[torch.Tensor] | None = None,
-    ref_ids: list[torch.Tensor] | None = None,
-    voice_clone_prompt: list[dict] = None,
-    languages: list[str] = None,
-    speakers: list[str] = None,
-    non_streaming_mode=False,        # False = streaming (default!), True = batch
-    max_new_tokens: int = 4096,
-    do_sample: bool = True,
-    top_k: int = 50,
-    top_p: float = 1.0,
-    temperature: float = 0.9,
-    subtalker_dosample: bool = True,
-    subtalker_top_k: int = 50,
-    subtalker_top_p: float = 1.0,
-    subtalker_temperature: float = 0.9,
-    eos_token_id: int | None = None,
-    repetition_penalty: float = 1.05,
+from qwen_tts import Qwen3TTSModel
+
+model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map="cuda", dtype=torch.bfloat16)
+
+# CustomVoice (our model variant):
+wavs, sr = model.generate_custom_voice(
+    text="Hello world",      # str or list[str] for batch
+    language="English",      # str or list[str]
+    speaker="Ryan",          # str or list[str] — must be in supported list
+    max_new_tokens=4096,
+    do_sample=True,
+    temperature=0.9,
+    top_k=50,
+    top_p=1.0,
 )
+# wavs: list[np.ndarray], sr: int (12000)
+audio = wavs[0]  # first batch item
 ```
 
-**Key finding:** `non_streaming_mode=False` is the default — **real streaming is on by default**. No need to fake-stream or manually chunk. The model yields audio incrementally.
+**Valid speakers:** Ryan, Aiden (EN), Vivian, Serena, Uncle_Fu, Dylan, Eric (ZH), Ono_Anna (JA), Sohee (KO)
 
-**input_ids format:** Must be a `list` of 1D tensors (not a batched 2D tensor). Pass `[ids[0]]` not `ids`.
+**Valid languages:** English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
-**Unknown:** What exactly `generate()` returns/yields in streaming mode — list of tensors, generator, queue? Must confirm from Phase A.4 run.
+**Lessons from failed attempts:**
+- `speakers=["default"]` → `NotImplementedError: Speaker default not implemented`
+- `speakers=[None]` → crashes at `input_id[:, :3]` (1D vs 2D tensor mismatch inside model)
+- Calling `model.generate()` directly with `input_ids` as list of 1D tensors → IndexError
+- The internal `generate()` expects 2D input_ids — but this is abstracted by `generate_custom_voice()`
+
+**Streaming:** `generate_custom_voice()` is blocking — returns full audio. Real streaming requires hooking the internal `generate()` loop. Deferred to Phase B.
 
 ---
 
