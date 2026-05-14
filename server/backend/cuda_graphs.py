@@ -140,9 +140,12 @@ class TalkerGraph:
         self.captured = True
         print("[TalkerGraph] CUDA graph captured.")
 
+    @torch.inference_mode()
     def prefill_kv(self, past_key_values) -> int:
         """
         Copy HF DynamicCache → StaticCache.
+        Must run under inference_mode because StaticCache tensors were created
+        inside inference_mode during capture and cannot be mutated outside it.
         past_key_values: DynamicCache with .layers[i].keys/values
         Returns: prefill seq_len
         """
@@ -161,14 +164,14 @@ class TalkerGraph:
     @torch.inference_mode()
     def run(self, input_embeds: torch.Tensor, position: int) -> torch.Tensor:
         """
-        Run one decode step.
+        Run one decode step via CUDA graph replay.
         input_embeds: [1, 1, hidden_size]
         position: current sequence position (prefill_len + step_idx)
-        Returns: [1, 1, hidden_size] last hidden state
+        Returns: [1, 1, hidden_size] last hidden state (clone before next call)
         """
         self.input_buf.copy_(input_embeds)
         self.cache_position[0] = position
-        if self.attn_mask is not None and self.attn_mask_table[position] is not None:
+        if self.attn_mask is not None and position < len(self.attn_mask_table) and self.attn_mask_table[position] is not None:
             self.attn_mask.copy_(self.attn_mask_table[position])
         self.graph.replay()
         return self.output_buf
@@ -317,6 +320,6 @@ class PredictorGraph:
         Returns: [15] long tensor — CB1..CB15 token IDs
         """
         self.input_buf.copy_(pred_input)
-        self.static_cache.reset()
+        self.static_cache.reset()  # must be under inference_mode
         self.graph.replay()
-        return self.output_tokens.clone()
+        return self.output_tokens.clone()  # clone so caller's tensor is independent

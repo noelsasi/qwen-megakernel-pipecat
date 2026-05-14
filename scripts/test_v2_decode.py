@@ -147,6 +147,10 @@ def stage3_eos(backend):
     def on_chunk(chunk):
         frames_out.extend([chunk[i] for i in range(chunk.shape[0])])
 
+    # Copy DynamicCache → StaticCache if CUDA graphs are active
+    if backend._talker_graph is not None:
+        backend._talker_graph.prefill_kv(past_kv)
+
     # Cap at 200 frames (~16s audio) so we don't hang waiting for EOS
     MAX_FRAMES = 200
     t0 = time.perf_counter()
@@ -163,6 +167,8 @@ def stage3_eos(backend):
             max_new_tokens=MAX_FRAMES,
             on_chunk=on_chunk,
             chunk_size=12,
+            talker_graph=backend._talker_graph,
+            predictor_graph=backend._predictor_graph,
         )
     torch.cuda.synchronize()
     t1 = time.perf_counter()
