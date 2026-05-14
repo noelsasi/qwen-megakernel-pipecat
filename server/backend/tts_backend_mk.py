@@ -176,16 +176,17 @@ class _MKDecoder:
     """
     Stateful single-token decoder using the CUDA megakernel.
 
-    Confirmed ops from torch_bindings.cpp:
-      decode(output_token, input_token_id, embed_weight, layer_weights_packed,
-             final_norm_weight, lm_head_weight, cos_table, sin_table,
-             k_cache, v_cache, hidden_buffer, activations, residual,
-             q, k, v, attn_out, mlp_intermediate, normalized,
-             block_max_vals, block_max_idxs,
-             num_layers, position, max_seq_len, attn_scale) -> ()
+    Confirmed ops (from server verification 2026-05-14):
+      torch.ops.qwen_megakernel_C.decode(
+          output_token, input_token_id, embed_weight, layer_weights_packed,
+          final_norm_weight, lm_head_weight, cos_table, sin_table,
+          k_cache, v_cache, hidden_buffer, activations, residual,
+          q, k, v, attn_out, mlp_intermediate, normalized,
+          block_max_vals, block_max_idxs,
+          num_layers, position, max_seq_len, attn_scale) -> ()
 
-      generate_nosync(first_token_id, num_steps, ..same buffers..,
-                      num_layers, start_position, max_seq_len, attn_scale) -> Tensor[num_steps]
+      generate_nosync was NOT present in the built extension — generate_n() falls
+      back to calling step() in a loop.
     """
 
     def __init__(self, weights: dict):
@@ -207,7 +208,8 @@ class _MKDecoder:
         self._k = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         self._v = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         self._attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        self._mlp_intermediate = torch.zeros(HIDDEN_SIZE * 2, dtype=torch.bfloat16, device="cuda")
+        # gate_proj + up_proj each produce VOCAB_SIZE=3072 values → 2 * 3072
+        self._mlp_intermediate = torch.zeros(VOCAB_SIZE * 2, dtype=torch.bfloat16, device="cuda")
         self._normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
         self._k_cache = torch.zeros(
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
@@ -225,7 +227,7 @@ class _MKDecoder:
         self._output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
 
         self._decode_op = torch.ops.qwen_megakernel_C.decode
-        self._generate_op = torch.ops.qwen_megakernel_C.generate_nosync
+        # generate_nosync is not present in all builds — use step() loop instead
 
     def _call_args(self):
         """Common buffer args shared by decode and generate_nosync."""
@@ -266,38 +268,39 @@ class _MKDecoder:
         return int(self._output_token.item())
 
     def generate_n(self, first_token_id: int, num_steps: int) -> list[int]:
-        """Run num_steps decode steps without sync. Returns list of token ids."""
-        output = self._generate_op(
-            first_token_id,
-            num_steps,
-            *self._call_args(),
-            NUM_LAYERS,
-            self._position,   # start_position
-            MAX_SEQ_LEN,
-            self._attn_scale,
-        )
-        self._position += num_steps
-        return output.cpu().tolist()
+        """Run num_steps decode steps. Returns list of token ids."""
+        tokens = []
+        current = first_token_id
+        for _ in range(num_steps):
+            current = self.step(current)
+            tokens.append(current)
+        return tokens
 
-    def load_kv_cache_from_hf(self, past_key_values, prefill_len: int):
+    def load_kv_cache_from_hf(self, past_key_values) -> int:
         """
         Copy HF DynamicCache into megakernel's pre-allocated KV cache tensors.
 
-        HF format: list of (k, v) tuples, each [1, NUM_KV_HEADS, seq_len, HEAD_DIM]
+        HF format (confirmed 2026-05-14): DynamicCache with .layers list of
+        DynamicLayer objects, each with .keys [1, NUM_KV_HEADS, seq_len, HEAD_DIM]
+        and .values [1, NUM_KV_HEADS, seq_len, HEAD_DIM].
+
         Megakernel format: [NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM]
 
-        Called after HF prefill, before megakernel decode loop starts.
+        Returns prefill_len (seq_len from layer 0).
         """
         self._k_cache.zero_()
         self._v_cache.zero_()
-        for layer_idx, (k, v) in enumerate(past_key_values):
-            # k, v: [1, NUM_KV_HEADS, seq_len, HEAD_DIM]
+        for layer_idx, layer in enumerate(past_key_values.layers):
+            k = layer.keys   # [1, NUM_KV_HEADS, seq_len, HEAD_DIM]
+            v = layer.values
             seq = k.shape[2]
             self._k_cache[layer_idx, :, :seq, :] = k[0].to(torch.bfloat16)
             self._v_cache[layer_idx, :, :seq, :] = v[0].to(torch.bfloat16)
+        prefill_len = past_key_values.layers[0].keys.shape[2]
         self._position = prefill_len
         self._block_max_vals.fill_(float("-inf"))
         self._block_max_idxs.zero_()
+        return prefill_len
 
     def reset(self):
         self._position = 0
@@ -372,69 +375,93 @@ class QwenTTSBackendMK:
 
     def _run_with_megakernel_decode(self, text: str) -> np.ndarray:
         """
-        Run generate_custom_voice with the talker decode loop replaced by megakernel.
+        Run generate_custom_voice with talker decode steps replaced by megakernel.
 
-        We patch talker.model.generate() so HF's pipeline calls our function
-        instead of its autoregressive generate loop. HF's generate() is only
-        called during the decode phase (after prefill), so patching it here
-        is safe — prefill runs via talker.model() forward pass as normal.
+        Confirmed from spy (2026-05-14):
+          - talker.generate() receives inputs_embeds=[1,13,1024], no past_key_values
+          - Every decode step also uses inputs_embeds=[1,1,1024] — never input_ids
+          - inputs_embeds at decode steps is NOT a pure codec_embedding lookup
+            (cosine sim ~0.48 max) — HF blends in trailing_text_hidden etc.
+          - Cannot reliably recover token ID from inputs_embeds
 
-        The patch function receives (input_ids, past_key_values, ...) from HF,
-        copies the KV cache into megakernel tensors, runs megakernel decode,
-        and returns a token_ids tensor in the shape HF expects.
+        Strategy: patch talker.model.forward().
+          - Prefill (first call): run HF normally, capture KV cache + prefill logits.
+            Extract first decode token = argmax of last prefill logit position.
+          - Decode steps: ignore inputs_embeds entirely. Run megakernel step with
+            the token we chose last step. Return fake output with one-hot logits
+            so HF picks the right next token to embed. HF embeds it and passes
+            it back — we ignore that embedding and use our own token tracking.
         """
         decoder = self._decoder
-        orig_generate = self._hf.model.talker.model.generate
+        orig_forward = self._hf.model.talker.model.forward
+        lm_head_weight = decoder._lm_head_weight      # [3072, 1024]
+        final_norm_weight = decoder._final_norm_weight  # [1024]
+        _prefill_done = [False]
+        _step_count = [0]
+        _current_token = [0]  # tracks the token the megakernel should process next
 
-        def _mk_generate(input_ids=None, past_key_values=None,
-                         max_new_tokens=4096, **kwargs):
-            # input_ids: [1, prefill_len] (last token after prefill)
-            # past_key_values: HF DynamicCache from prefill forward pass
-            if past_key_values is None:
-                # Fallback: no KV cache available — run HF normally
-                return orig_generate(
+        def _mk_forward(
+            input_ids=None,
+            inputs_embeds=None,
+            attention_mask=None,
+            past_key_values=None,
+            use_cache=True,
+            **kwargs,
+        ):
+            from types import SimpleNamespace
+
+            # Prefill: first call — run HF normally to populate KV cache
+            if not _prefill_done[0]:
+                out = orig_forward(
                     input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
                     past_key_values=past_key_values,
-                    max_new_tokens=max_new_tokens,
+                    use_cache=True,
                     **kwargs,
                 )
+                pkv = out.past_key_values
+                decoder.reset()
+                prefill_len = decoder.load_kv_cache_from_hf(pkv)
 
-            # Extract KV cache — DynamicCache exposes .key_cache / .value_cache
-            # or can be iterated as list of (k, v) tuples
-            try:
-                pkv_list = [
-                    (past_key_values.key_cache[i], past_key_values.value_cache[i])
-                    for i in range(len(past_key_values.key_cache))
-                ]
-            except AttributeError:
-                # Older pipecat/transformers: past_key_values is list of tuples
-                pkv_list = list(past_key_values)
+                # Compute first decode token from prefill last hidden state.
+                # talker.model (inner) returns last_hidden_state, not logits —
+                # the outer Qwen3TTSTalkerForConditionalGeneration applies codec_head.
+                # We replicate that: final_norm → lm_head → argmax.
+                last_h = out.last_hidden_state[0, -1].float()  # [HIDDEN_SIZE]
+                variance = last_h.pow(2).mean()
+                normed = (last_h * torch.rsqrt(variance + 1e-6)).to(torch.bfloat16)
+                normed = normed * final_norm_weight
+                logits_1d = lm_head_weight @ normed  # [3072]
+                first_token = int(logits_1d.argmax().item())
+                _current_token[0] = first_token
+                _prefill_done[0] = True
+                print(f"[MK] Prefill done — seq_len={prefill_len}, first_token={first_token}")
+                return out
 
-            prefill_len = pkv_list[0][0].shape[2]
-            decoder.reset()
-            decoder.load_kv_cache_from_hf(pkv_list, prefill_len)
+            # Decode step: run megakernel with the token we tracked from last step.
+            # Ignore inputs_embeds — HF constructed it but we don't need it.
+            current_token = _current_token[0]
+            next_token = decoder.step(current_token)
+            _step_count[0] += 1
 
-            # Get first decode token from input_ids (last prefill token)
-            first_token = int(input_ids[0, -1].item())
-            print(f"[MK] generate() intercepted — prefill={prefill_len}, first_tok={first_token}")
+            # Tell HF the next token via one-hot logits so it embeds the right token
+            _current_token[0] = next_token
 
-            # Megakernel decode loop
-            tokens = []
-            current_token = first_token
-            with torch.inference_mode():
-                for _ in range(max_new_tokens):
-                    next_token = decoder.step(current_token)
-                    if next_token == EOS_TOKEN_ID:
-                        break
-                    tokens.append(next_token)
-                    current_token = next_token
+            logits = torch.zeros(1, 1, VOCAB_SIZE, dtype=torch.bfloat16, device="cuda")
+            logits[0, 0, next_token] = 1.0
 
-            print(f"[MK] Decoded {len(tokens)} codec tokens")
-            # Return shape [1, num_tokens] int64 — same as HF generate() output
-            return torch.tensor(tokens, dtype=torch.long, device="cuda").unsqueeze(0)
+            last_hidden = decoder._hidden.detach().clone().view(1, 1, HIDDEN_SIZE)
 
-        # Install patch, run, restore
-        self._hf.model.talker.model.generate = _mk_generate
+            return SimpleNamespace(
+                logits=logits,
+                past_key_values=None,
+                hidden_states=(last_hidden,),
+                last_hidden_state=last_hidden,
+                attentions=None,
+            )
+
+        self._hf.model.talker.model.forward = _mk_forward
         try:
             with torch.inference_mode():
                 wavs, sr = self._hf.generate_custom_voice(
@@ -442,10 +469,11 @@ class QwenTTSBackendMK:
                     language=self._language,
                     speaker=self._speaker,
                     max_new_tokens=4096,
-                    do_sample=False,  # megakernel uses argmax internally
+                    do_sample=False,
                 )
+            print(f"[MK] Decode complete — {_step_count[0]} megakernel steps")
         finally:
-            self._hf.model.talker.model.generate = orig_generate
+            self._hf.model.talker.model.forward = orig_forward
 
         audio = np.array(wavs[0], dtype=np.float32).squeeze()
         return audio

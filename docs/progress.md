@@ -66,10 +66,52 @@ we now patch `talker.model.generate()` at call time:
 
 The patch is thread-safe per-call (install → run → restore in try/finally).
 
-### Next Session Priorities
+---
 
-- [ ] **Run Phase C on GPU** — `make server` + connect React client, confirm STT→LLM→TTS works end-to-end
-- [ ] **Test megakernel decode** — set `TTS_BACKEND=megakernel`, verify `_run_with_megakernel_decode` fires and audio is correct vs HF baseline
-- [ ] **flash-attn** — `pip install flash-attn --no-build-isolation` then re-run baseline (quick RTF improvement without megakernel)
-- [ ] **Full benchmark** — `make benchmark --backend both` — fill in the README numbers table
-- [ ] **README** — write with real numbers once demo works
+## 2026-05-14 — Session 3
+
+### Summary
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Environment setup | ✅ | Megakernel built, ops confirmed: `decode` + `name` only |
+| Phase A — Baseline inference | ✅ | RTF 0.879 confirmed |
+| Phase D — Megakernel build | ✅ | `decode` op loads. `generate_nosync` NOT present in this build |
+| Phase D — Full integration | ⚠️ Written, untested | Monkey-patch approach coded; not yet run end-to-end on GPU |
+| Phase C — Pipecat pipeline | ⚠️ Written, untested | `voice_agent.py` complete; not yet started on server |
+| Phase B — Real streaming | ❌ Not implemented | Fake streaming only — full audio buffered before chunking |
+
+### Confirmed from server output
+
+- `pip install -e .` fails on megakernel (no `setup.py` / `pyproject.toml`) — **non-fatal**, `get_extension()` JIT-builds the `.so` directly
+- Registered ops: `['decode', 'name']` — **`generate_nosync` does NOT exist** in this build
+- Setup script `set -euo pipefail` was causing exit on the `pip install -e .` error — fixed to `|| true`
+
+### Fixes shipped (Session 3)
+
+| File | Fix |
+|------|-----|
+| `server/backend/tts_backend_mk.py` | Removed `generate_nosync` reference (crashes on init). `generate_n()` now calls `step()` in a loop |
+| `server/backend/tts_backend_mk.py` | Fixed `_mlp_intermediate` buffer: was `HIDDEN_SIZE*2=2048`, must be `VOCAB_SIZE*2=6144` (gate + up proj each 3072) |
+| `scripts/setup_server.sh` | Replaced `pip install -e .` with `python build.py \|\| true` — no-op if already built |
+| `scripts/test_mk_decode.py` | **New**: staged smoke test — op schema, single decode step with zero weights, full end-to-end with WAV output |
+
+### Known gaps vs assignment requirements
+
+1. **Fake streaming** — `synthesize_streaming()` buffers full audio then chunks it. Assignment requires token-by-token push. The monkey-patch approach makes true streaming hard: the patched `generate()` must return a complete token tensor to HF before the vocoder runs. True streaming would require intercepting the vocoder too.
+
+2. **End-to-end never run** — The full `_run_with_megakernel_decode` → `generate_custom_voice` path has not been executed on GPU. Still needs verification.
+
+3. **No performance numbers** — README table is blank. Need to run `scripts/benchmark.py` and fill in real values.
+
+4. **No demo recording** — Required deliverable. Needs the pipeline running end-to-end first.
+
+### Next session: immediate priorities (in order)
+
+1. `git pull && python scripts/test_mk_decode.py` — confirm decode op signature, single step, end-to-end
+2. If stage 2 fails with arg error: paste the schema line + error, fix arg order
+3. If stage 3 fails with `AttributeError` on `DynamicCache`: paste traceback, fix KV cache extraction
+4. Once `test_mk_decode.py` passes: `uvicorn server.pipeline.voice_agent:app` — check for import errors
+5. Connect React client, confirm STT→LLM→TTS→audio round-trip works
+6. `python scripts/benchmark.py --backend both --trials 5` — get real numbers
+7. Record demo, fill README table

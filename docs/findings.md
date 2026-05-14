@@ -1,7 +1,7 @@
 # Findings & Observations
 
 > Ground truth only — confirmed by running actual code.
-> Last updated: 2026-05-14 (Session 1)
+> Last updated: 2026-05-14 (Session 3)
 
 ---
 
@@ -124,49 +124,58 @@ audio = wavs[0]
 
 ### Build
 
-- No `setup.py` — uses JIT compilation via `torch.utils.cpp_extension.load`
-- Build trigger: `from qwen_megakernel.build import get_extension; get_extension()`
+- No `setup.py` or `pyproject.toml` — `pip install -e .` **fails** (non-fatal)
+- Real build trigger: `from qwen_megakernel.build import get_extension; get_extension()`
+- Uses `torch.utils.cpp_extension.load` JIT compilation on first call
 - JIT cache: `/root/.cache/torch_extensions/py314_cu128/qwen_megakernel_C/`
 - Compiled for: sm_120a (RTX 5090 Blackwell only)
+- `setup_server.sh` now uses `python build.py || true` instead of `pip install -e .`
 
-### Ops (confirmed from torch_bindings.cpp)
+### Ops (confirmed from server — Session 3)
+
+```
+Registered ops: ['decode', 'name']
+```
+
+**`generate_nosync` is NOT present** in the built extension. Only `decode` exists.
+`generate_n()` in `tts_backend_mk.py` falls back to calling `step()` in a loop.
 
 ```python
 # Single decode step — writes output token into pre-allocated tensor
+# Arg order inferred from torch_bindings.cpp — NOT yet verified on GPU with real weights
+# Run scripts/test_mk_decode.py stage 2 to confirm schema
 torch.ops.qwen_megakernel_C.decode(
-    output_token,        # int32 tensor [1] — written in-place
-    input_token_id,      # int
-    embed_weight,        # [VOCAB, HIDDEN] bfloat16
-    layer_weights_packed,# packed struct blob
-    final_norm_weight,   # [HIDDEN] bfloat16
-    lm_head_weight,      # [VOCAB, HIDDEN] bfloat16
-    cos_table,           # [MAX_SEQ_LEN, HEAD_DIM] bfloat16
-    sin_table,           # [MAX_SEQ_LEN, HEAD_DIM] bfloat16
-    k_cache,             # [NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM] bfloat16
-    v_cache,             # same shape
-    hidden_buffer,       # [HIDDEN] bfloat16
-    activations,         # [HIDDEN] bfloat16
-    residual,            # [HIDDEN] bfloat16
-    q,                   # [NUM_Q_HEADS * HEAD_DIM] bfloat16
-    k,                   # [NUM_KV_HEADS * HEAD_DIM] bfloat16
-    v,                   # same
-    attn_out,            # [NUM_Q_HEADS * HEAD_DIM] bfloat16
-    mlp_intermediate,    # [HIDDEN * 2] bfloat16
-    normalized,          # [HIDDEN] bfloat16
-    block_max_vals,      # [8] float32  (LDG_ATTN_BLOCKS=8)
-    block_max_idxs,      # [8] int32
-    num_layers,          # int
-    position,            # int (plain integer, NOT a tensor)
-    max_seq_len,         # int
-    attn_scale,          # float
+    output_token,         # int32 tensor [1] — written in-place
+    input_token_id,       # int
+    embed_weight,         # [VOCAB_SIZE=3072, HIDDEN=1024] bfloat16
+    layer_weights_packed, # packed pointer buffer (uint8 on CUDA)
+    final_norm_weight,    # [HIDDEN=1024] bfloat16
+    lm_head_weight,       # [VOCAB_SIZE=3072, HIDDEN=1024] bfloat16
+    cos_table,            # [MAX_SEQ_LEN, HEAD_DIM=128] bfloat16
+    sin_table,            # same shape
+    k_cache,              # [NUM_LAYERS=28, NUM_KV_HEADS=8, MAX_SEQ_LEN, HEAD_DIM=128] bfloat16
+    v_cache,              # same shape
+    hidden_buffer,        # [HIDDEN=1024] bfloat16
+    activations,          # [HIDDEN=1024] bfloat16
+    residual,             # [HIDDEN=1024] bfloat16
+    q,                    # [NUM_Q_HEADS=16 * HEAD_DIM=128 = 2048] bfloat16
+    k,                    # [NUM_KV_HEADS=8 * HEAD_DIM=128 = 1024] bfloat16
+    v,                    # same as k
+    attn_out,             # [2048] bfloat16
+    mlp_intermediate,     # [VOCAB_SIZE*2 = 6144] bfloat16  ← gate+up proj each 3072
+    normalized,           # [HIDDEN=1024] bfloat16
+    block_max_vals,       # [8] float32  (LDG_ATTN_BLOCKS=8)
+    block_max_idxs,       # [8] int32
+    num_layers,           # int = 28
+    position,             # int (plain integer, NOT a tensor)
+    max_seq_len,          # int = 32768
+    attn_scale,           # float = HEAD_DIM**-0.5 ≈ 0.0884
 ) -> ()
-
-# Multi-step without sync — returns int32 tensor of token IDs
-torch.ops.qwen_megakernel_C.generate_nosync(
-    first_token_id, num_steps, ...same buffers...,
-    num_layers, start_position, max_seq_len, attn_scale
-) -> Tensor[num_steps, int32]
 ```
+
+**⚠️ `mlp_intermediate` buffer correction (Session 3):** Was incorrectly sized at
+`HIDDEN_SIZE*2=2048`. Correct size is `VOCAB_SIZE*2=6144` — gate_proj and up_proj
+each project to the intermediate dimension (3072), not HIDDEN_SIZE.
 
 ### Compatibility with TTS talker
 
@@ -184,19 +193,26 @@ torch.ops.qwen_megakernel_C.generate_nosync(
 
 **All kernel.cu mismatches are now fixed.** Remaining fixes are Python-only (cos/sin table builder).
 
-### Single decode step — confirmed working
+### Single decode step — confirmed working (Session 1)
 
 ```
 step(0) → token 112  ✅
 ```
 
-### Integration blocker
+This used isolated buffers with zero weights. The full `_MKDecoder` path with real
+weights has not yet been run. See `scripts/test_mk_decode.py` stage 2 + 3.
 
-The megakernel decode loop cannot be wired to the HF model because:
+### Integration approach (Session 2 — monkey-patch)
 
-1. **Prefill uses `inputs_embeds`** — HF talker prefill constructs a mixed float embedding (text projections + codec special tokens + speaker embeddings). The megakernel only accepts integer token IDs and does its own embedding lookup. No clean interface exists between them.
+Original blockers from Session 1 were resolved by NOT trying to split the model:
 
-2. **Vocoder has no public API** — The speech tokenizer (vocoder) that converts codec token sequences to audio is called internally inside `Qwen3TTSModel.generate_custom_voice()`. There is no exposed method to run it on a custom codec sequence.
+1. ~~**Prefill uses `inputs_embeds`**~~ — Resolved: let HF run prefill normally. We only intercept `talker.model.generate()`, which is called after prefill with a `DynamicCache` already populated.
+
+2. ~~**Vocoder has no public API**~~ — Resolved: the monkey-patched `generate()` returns a complete `[1, N]` token tensor to HF. HF then runs `code_predictor` + vocoder as normal. We never need to call the vocoder ourselves.
+
+**Current approach:** patch `talker.model.generate` at call time, copy KV cache from HF `DynamicCache` into megakernel buffers, run decode loop, return token tensor. HF continues from there unchanged.
+
+**Status:** coded, not yet run end-to-end on GPU. Run `scripts/test_mk_decode.py` to verify.
 
 ### KV cache layout (confirmed)
 

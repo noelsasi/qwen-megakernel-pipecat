@@ -26,6 +26,8 @@ print(f'GPU: {torch.cuda.get_device_name(0)}  CUDA: {torch.version.cuda}')
 
 # Project deps
 pip install -r requirements.txt
+# qwen-tts must be installed after torch (it has torch as a dep)
+pip install -U qwen-tts
 
 # Clone megakernel
 if [ ! -d "qwen_megakernel" ]; then
@@ -37,7 +39,8 @@ sed -i 's/LDG_VOCAB_SIZE = 151936/LDG_VOCAB_SIZE = 3072/' qwen_megakernel/csrc/k
 echo "Patched LDG_VOCAB_SIZE → 3072"
 
 # Build megakernel (targets sm_120a — RTX 5090 only)
-cd qwen_megakernel && pip install -e . && cd ..
+# pip install -e . is not needed — get_extension() builds and loads the .so directly
+cd qwen_megakernel && python build.py 2>&1 || true && cd ..
 
 # Verify
 python -c "
