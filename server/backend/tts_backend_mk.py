@@ -458,7 +458,7 @@ class QwenTTSBackendMK:
                 print(f"[MK] step {_step_count[0]}: {current_token} -> {next_token}")
 
             # If EOS, signal it via logits so HF stops
-            if next_token == EOS_TOKEN_ID or _step_count[0] >= 2048:
+            if next_token == EOS_TOKEN_ID or _step_count[0] >= 500:
                 print(f"[MK] EOS at step {_step_count[0]}, token={next_token}")
                 next_token = EOS_TOKEN_ID
 
@@ -484,7 +484,7 @@ class QwenTTSBackendMK:
                     text=text,
                     language=self._language,
                     speaker=self._speaker,
-                    max_new_tokens=4096,
+                    max_new_tokens=500,
                     do_sample=False,
                 )
             print(f"[MK] Decode complete — {_step_count[0]} megakernel steps")
