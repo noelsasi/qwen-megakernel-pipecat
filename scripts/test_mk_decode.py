@@ -42,8 +42,8 @@ def check_ops():
 def check_single_step():
     from server.backend.tts_backend_mk import (
         NUM_LAYERS, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM,
-        HIDDEN_SIZE, VOCAB_SIZE, MAX_SEQ_LEN, ROPE_THETA, MROPE_SECTION,
-        _build_mrope_tables,
+        HIDDEN_SIZE, VOCAB_SIZE, MAX_SEQ_LEN, ROPE_THETA,
+        _build_rope_tables,
     )
 
     print("\n[2] Allocating minimal buffers for single decode step ...")
@@ -78,7 +78,7 @@ def check_single_step():
         struct.pack_into("Q", buf, i * 8, t.data_ptr())
     layer_weights_packed = torch.frombuffer(buf, dtype=torch.uint8).cuda()
 
-    cos_table, sin_table = _build_mrope_tables()
+    cos_table, sin_table = _build_rope_tables()
 
     k_cache = torch.zeros(NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     v_cache = torch.zeros(NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16, device="cuda")

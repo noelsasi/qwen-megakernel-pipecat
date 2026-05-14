@@ -59,7 +59,8 @@ HIDDEN_SIZE = 1024
 VOCAB_SIZE = 3072        # codec tokens — kernel.cu LDG_VOCAB_SIZE must match
 MAX_SEQ_LEN = 32768      # Python only — no kernel rebuild needed
 ROPE_THETA = 1_000_000.0
-MROPE_SECTION = [24, 20, 20]  # of HEAD_DIM//2=64; sums to 64
+# Note: talker uses standard 1D RoPE (position_ids shape [1, seq_len]),
+# NOT interleaved MRope — confirmed from attention layer inspection.
 
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 SAMPLE_RATE = 24000
@@ -70,49 +71,34 @@ EOS_TOKEN_ID = 2150  # confirmed from generation warning
 # MRope cos/sin table builder
 # ---------------------------------------------------------------------------
 
-def _build_mrope_tables(
+def _build_rope_tables(
     max_seq_len: int = MAX_SEQ_LEN,
     head_dim: int = HEAD_DIM,
     theta: float = ROPE_THETA,
-    mrope_section: list = MROPE_SECTION,
+    inv_freq: torch.Tensor = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build [max_seq_len, head_dim] bfloat16 cos/sin tables for interleaved MRope.
+    Build [max_seq_len, head_dim] bfloat16 cos/sin tables matching HF's RoPE.
 
-    MRope interleaved layout (Qwen3-VL/TTS pattern):
-      - half_dim = head_dim // 2 = 64 frequency slots
-      - mrope_section [24, 20, 20] partitions these 64 slots across 3 position streams
-      - Interleaved: T0 H0 A0 T1 H1 A1 ... (round-robin across streams)
-      - During TTS autoregressive decode all 3 streams share the same step index
-      - Final table uses .repeat(1,2) to fill full head_dim (standard RoPE convention)
+    Confirmed from inspection (2026-05-14): talker uses standard 1D position_ids
+    [0,1,...,N-1] with Qwen3TTSTalkerRotaryEmbedding (theta=1e6, standard RoPE).
+    NOT interleaved MRope — position_ids shape is [1, seq_len], not [3, 1, seq_len].
+
+    If inv_freq is provided (copied from model.rotary_emb.inv_freq), use it directly
+    to guarantee exact match with HF. Otherwise compute from theta.
     """
-    half_dim = head_dim // 2  # 64
-    assert sum(mrope_section) == half_dim, \
-        f"mrope_section {mrope_section} must sum to HEAD_DIM//2={half_dim}"
+    if inv_freq is not None:
+        inv_f = inv_freq.float().cpu()
+    else:
+        idx = torch.arange(0, head_dim, 2, dtype=torch.float32)
+        inv_f = 1.0 / (theta ** (idx / head_dim))  # [head_dim//2]
 
-    # inv_freq per section — same theta, section-relative indexing
-    inv_freqs = []
-    for section_dim in mrope_section:
-        idx = torch.arange(0, section_dim, 2, dtype=torch.float32)
-        inv_freqs.append(1.0 / (theta ** (idx / section_dim)))
+    positions = torch.arange(max_seq_len, dtype=torch.float32)  # [max_seq_len]
+    freqs = torch.outer(positions, inv_f)  # [max_seq_len, head_dim//2]
+    emb = torch.cat([freqs, freqs], dim=-1)  # [max_seq_len, head_dim]
 
-    positions = torch.arange(max_seq_len, dtype=torch.float32)
-    section_freqs = [torch.outer(positions, inv_f) for inv_f in inv_freqs]
-    # shapes: [max_seq_len, 12], [max_seq_len, 10], [max_seq_len, 10]
-
-    section_pairs = [s // 2 for s in mrope_section]  # [12, 10, 10]
-    max_pairs = max(section_pairs)
-
-    interleaved = []
-    for pair_idx in range(max_pairs):
-        for axis_idx, n_pairs in enumerate(section_pairs):
-            if pair_idx < n_pairs:
-                interleaved.append(section_freqs[axis_idx][:, pair_idx : pair_idx + 1])
-
-    all_freqs = torch.cat(interleaved, dim=1)  # [max_seq_len, 32]
-
-    cos_table = torch.cos(all_freqs).repeat(1, 2).to(torch.bfloat16).cuda().contiguous()
-    sin_table = torch.sin(all_freqs).repeat(1, 2).to(torch.bfloat16).cuda().contiguous()
+    cos_table = torch.cos(emb).to(torch.bfloat16).cuda().contiguous()
+    sin_table = torch.sin(emb).to(torch.bfloat16).cuda().contiguous()
     return cos_table, sin_table  # each [max_seq_len, head_dim]
 
 
@@ -189,12 +175,12 @@ class _MKDecoder:
       back to calling step() in a loop.
     """
 
-    def __init__(self, weights: dict):
+    def __init__(self, weights: dict, inv_freq: torch.Tensor = None):
         self._weights = weights  # keep references — prevents GC of GPU tensors
         self._position = 0
         self._attn_scale = float(HEAD_DIM ** -0.5)
 
-        self._cos_table, self._sin_table = _build_mrope_tables()
+        self._cos_table, self._sin_table = _build_rope_tables(inv_freq=inv_freq)
         self._embed_weight = weights["embed_weight"]
         self._final_norm_weight = weights["final_norm_weight"]
         self._lm_head_weight = weights["lm_head_weight"]
@@ -367,7 +353,9 @@ class QwenTTSBackendMK:
         print(f"[QwenTTSBackendMK] Extracting weights + building decoder ...")
         state = self._hf.model.state_dict()
         weights = _extract_talker_weights(state)
-        self._decoder = _MKDecoder(weights)
+        # Copy inv_freq from HF rotary embedding to guarantee exact RoPE match
+        inv_freq = self._hf.model.talker.model.rotary_emb.inv_freq.detach().cpu()
+        self._decoder = _MKDecoder(weights, inv_freq=inv_freq)
         # mk_decoder exposed for benchmark access
         self.mk_decoder = self._decoder
 
