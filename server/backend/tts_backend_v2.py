@@ -206,41 +206,66 @@ def _custom_decode_loop(
     Returns: list of all [16]-tensors (one per codec frame)
     """
     device = past_hidden.device
-    talker_model = talker.model   # Qwen3Model (the backbone)
-    codec_head = talker.codec_head        # [3072, 1024] lm_head
-    codec_embedding = talker.get_input_embeddings()   # nn.Embedding(3072, 1024)
+    talker_model = talker.model
+    codec_head = talker.codec_head
+    codec_embedding = talker.get_input_embeddings()
 
     predictor = talker.code_predictor
-    predictor_codec_embeds = predictor.get_input_embeddings()   # list of 15 Embedding(2048, 1024)
-    num_code_groups = config.num_code_groups   # 16
+    pred_model = predictor.model
+    pred_lm_heads = predictor.lm_head           # ModuleList of 15 Linear heads
+    pred_embeds = predictor.get_input_embeddings()  # ModuleList of 15 Embeddings(2048, 1024)
+    # predictor_codec_embeds used for building next-step talker embedding
+    predictor_codec_embeds = pred_embeds
 
+    num_code_groups = config.num_code_groups   # 16
     eos_id = EOS_TOKEN_ID
     vocab_size = config.vocab_size   # 3072
+    suppress_start = max(0, vocab_size - 1024)   # 2048
 
-    # suppress_tokens matches official modeling_qwen3_tts.py lines ~1702-1706:
-    #   [i for i in range(vocab_size - 1024, vocab_size) if i != codec_eos_token_id]
-    # = all of [2048..3071] except 2150 (EOS).
-    # This is applied per-step. EOS is additionally suppressed for min_new_tokens steps.
-    suppress_start = max(0, vocab_size - 1024)   # = 2048
+    # Pre-build suppress mask on GPU — avoids repeated masked_fill calls per step
+    # Suppresses [2048..3071] except EOS=2150, matching official suppress_tokens list
+    _suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    _suppress_mask[suppress_start:eos_id] = True
+    _suppress_mask[eos_id + 1:] = True
 
     def _sample(logits_1d: torch.Tensor, suppress_eos: bool) -> torch.Tensor:
-        """Sample from [vocab_size] logits. Returns scalar int64 tensor."""
         logits_1d = logits_1d.clone()
-        # Suppress [2048..3071] except EOS slot at 2150
-        logits_1d[suppress_start:eos_id] = float("-inf")   # [2048..2149]
-        logits_1d[eos_id + 1:] = float("-inf")             # [2151..3071]
+        logits_1d[_suppress_mask] = float("-inf")
         if suppress_eos:
-            logits_1d[eos_id] = float("-inf")              # suppress EOS for warmup steps
-
+            logits_1d[eos_id] = float("-inf")
         if do_sample and temperature > 0:
             logits_1d = logits_1d / temperature
             if top_k > 0:
                 topk_vals = torch.topk(logits_1d, min(top_k, logits_1d.size(-1))).values
                 logits_1d = logits_1d.masked_fill(logits_1d < topk_vals[-1], float("-inf"))
-            probs = torch.softmax(logits_1d, dim=-1)
-            return torch.multinomial(probs, 1).squeeze()
-        else:
-            return logits_1d.argmax()
+            return torch.multinomial(torch.softmax(logits_1d, dim=-1), 1).squeeze()
+        return logits_1d.argmax()
+
+    def _run_predictor(pred_input: torch.Tensor) -> torch.Tensor:
+        """
+        Run code predictor for 15 codebook steps. Returns [15] int64 tensor.
+        pred_input: [1, 2, hidden] = cat(past_hidden, last_id_hidden)
+        """
+        cb_tokens = []
+        # Prefill: 2-token sequence through 5-layer predictor
+        pred_out = pred_model(inputs_embeds=pred_input, use_cache=True, return_dict=True)
+        pred_pkv = pred_out.past_key_values
+        cb_logits = pred_lm_heads[0](pred_out.last_hidden_state[:, -1, :])
+        cb_tok = (torch.multinomial(torch.softmax(cb_logits / temperature, -1), 1).squeeze()
+                  if do_sample and temperature > 0 else cb_logits.argmax(-1).squeeze())
+        cb_tokens.append(cb_tok)
+
+        for cb_idx in range(1, num_code_groups - 1):
+            cb_emb = pred_embeds[cb_idx - 1](cb_tok.unsqueeze(0).unsqueeze(0))
+            pred_out = pred_model(inputs_embeds=cb_emb, past_key_values=pred_pkv,
+                                  use_cache=True, return_dict=True)
+            pred_pkv = pred_out.past_key_values
+            cb_logits = pred_lm_heads[cb_idx](pred_out.last_hidden_state[:, -1, :])
+            cb_tok = (torch.multinomial(torch.softmax(cb_logits / temperature, -1), 1).squeeze()
+                      if do_sample and temperature > 0 else cb_logits.argmax(-1).squeeze())
+            cb_tokens.append(cb_tok)
+
+        return torch.stack(cb_tokens)  # [15]
 
     # First token from prefill logits
     token = _sample(first_logits.squeeze(0), suppress_eos=(min_new_tokens > 0))
@@ -249,68 +274,18 @@ def _custom_decode_loop(
     chunk_buffer = []
     step = 0
 
-    # Build attention mask incrementally (start with prefill length from past_kv)
-    # We'll let HF manage attention mask via DynamicCache — just pass None and let
-    # the model handle causal masking automatically
-
     for step_idx in range(max_new_tokens):
-        tok_val = token.item()
+        tok_val = token.item()   # CPU sync — needed to check EOS
         if tok_val == eos_id:
-            logger.info(f"[v2] EOS fired at step {step_idx} (token={tok_val})")
+            logger.info(f"[v2] EOS fired at step {step_idx}")
             break
         if step_idx < 3:
-            logger.info(f"[v2] step {step_idx}: token={tok_val}")
+            logger.debug(f"[v2] step {step_idx}: token={tok_val}")
 
-        # --- Code predictor: produce CB1..CB15 via manual forward loop ---
-        # Avoids HF generate() overhead (tokenizer, sampling machinery, Python dispatch).
-        # Mirrors PredictorGraph.run() in faster-qwen3-tts.
+        # --- Code predictor: CB1..CB15 ---
         last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))   # [1, 1, 1024]
         pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)         # [1, 2, 1024]
-
-        pred_model = predictor.model          # backbone (5-layer transformer)
-        pred_lm_heads = predictor.lm_head     # ModuleList of 15 Linear heads
-        pred_embeds = predictor.get_input_embeddings()  # ModuleList of 15 Embeddings
-
-        codebook_token_ids = []
-        pred_past_kv = None
-        # Step 0: prefill the predictor with [past_hidden, last_id_hidden]
-        pred_out = pred_model(
-            inputs_embeds=pred_input,
-            past_key_values=pred_past_kv,
-            use_cache=True,
-            return_dict=True,
-        )
-        pred_hidden = pred_out.last_hidden_state   # [1, 2, pred_hidden]
-        pred_past_kv = pred_out.past_key_values
-        # Sample CB1 from last position of prefill
-        cb_logits = pred_lm_heads[0](pred_hidden[:, -1, :])   # [1, pred_vocab]
-        if do_sample and temperature > 0:
-            cb_tok = torch.multinomial(torch.softmax(cb_logits / temperature, -1), 1).squeeze()
-        else:
-            cb_tok = cb_logits.argmax(-1).squeeze()
-        codebook_token_ids.append(cb_tok)
-
-        # Steps 1-14: each uses the previous CB token's embedding as input
-        for cb_idx in range(1, num_code_groups - 1):
-            cb_emb = pred_embeds[cb_idx - 1](cb_tok.unsqueeze(0).unsqueeze(0))  # [1, 1, pred_hidden]
-            pred_out = pred_model(
-                inputs_embeds=cb_emb,
-                past_key_values=pred_past_kv,
-                use_cache=True,
-                return_dict=True,
-            )
-            pred_hidden = pred_out.last_hidden_state
-            pred_past_kv = pred_out.past_key_values
-            cb_logits = pred_lm_heads[cb_idx](pred_hidden[:, -1, :])
-            if do_sample and temperature > 0:
-                cb_tok = torch.multinomial(torch.softmax(cb_logits / temperature, -1), 1).squeeze()
-            else:
-                cb_tok = cb_logits.argmax(-1).squeeze()
-            codebook_token_ids.append(cb_tok)
-
-        codebook_token_ids = torch.stack(codebook_token_ids)  # [15]
-        if step_idx == 0:
-            logger.info(f"[v2] predictor manual loop: {codebook_token_ids.tolist()}")
+        codebook_token_ids = _run_predictor(pred_input)                      # [15]
 
         # Full codec frame: CB0 + CB1..CB15
         all_cb = torch.cat([token.view(1), codebook_token_ids])   # [16]

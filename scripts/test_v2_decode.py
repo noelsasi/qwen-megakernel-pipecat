@@ -132,7 +132,7 @@ def stage2_single_decode_step(backend, past_kv, past_hidden, gen_step, trailing,
 
 
 def stage3_eos(backend):
-    logger.info("=== STAGE 3: Full decode to EOS ===")
+    logger.info("=== STAGE 3: Full decode to EOS + timing breakdown ===")
     import torch
     from server.backend.tts_backend_v2 import _build_prefill_inputs_and_run, _custom_decode_loop, EOS_TOKEN_ID
 
@@ -185,6 +185,67 @@ def stage3_eos(backend):
         logger.warning(f"  EOS did NOT fire — ran full {MAX_FRAMES} frames")
     logger.info("STAGE 3 PASS" if eos_likely else f"STAGE 3 PARTIAL — no EOS after {MAX_FRAMES} frames")
     return frames
+
+
+def stage3b_timing(backend):
+    """Micro-benchmark: isolate predictor vs talker backbone time per step."""
+    logger.info("=== STAGE 3b: Timing breakdown (predictor vs talker) ===")
+    import torch
+    from server.backend.tts_backend_v2 import _build_prefill_inputs_and_run
+
+    past_kv, past_hidden, gen_step, trailing, tts_pad, first_logits = \
+        _build_prefill_inputs_and_run(backend._hf, TEST_TEXT, SPEAKER, LANGUAGE)
+
+    talker = backend._talker
+    talker_model = talker.model
+    codec_embedding = talker.get_input_embeddings()
+    codec_head = talker.codec_head
+    predictor = talker.code_predictor
+    pred_model = predictor.model
+    pred_lm_heads = predictor.lm_head
+    pred_embeds = predictor.get_input_embeddings()
+
+    token = first_logits.squeeze(0).argmax()
+    N_STEPS = 10
+
+    # Warm up
+    with torch.inference_mode():
+        for _ in range(2):
+            last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))
+            pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)
+            pred_out = pred_model(inputs_embeds=pred_input, use_cache=False, return_dict=True)
+    torch.cuda.synchronize()
+
+    # Time predictor only (one full 15-step run)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for _ in range(N_STEPS):
+            last_id_hidden = codec_embedding(token.unsqueeze(0).unsqueeze(0))
+            pred_input = torch.cat([past_hidden, last_id_hidden], dim=1)
+            pred_out = pred_model(inputs_embeds=pred_input, use_cache=True, return_dict=True)
+            pred_pkv = pred_out.past_key_values
+            for cb_idx in range(1, 15):
+                cb_emb = pred_embeds[cb_idx - 1](token.unsqueeze(0).unsqueeze(0))
+                pred_out = pred_model(inputs_embeds=cb_emb, past_key_values=pred_pkv,
+                                      use_cache=True, return_dict=True)
+                pred_pkv = pred_out.past_key_values
+    torch.cuda.synchronize()
+    t_pred = (time.perf_counter() - t0) / N_STEPS * 1000
+
+    # Time talker backbone only (one decode step, no KV cache growth reset)
+    t0 = time.perf_counter()
+    embed = codec_embedding(token.unsqueeze(0).unsqueeze(0))
+    with torch.inference_mode():
+        for _ in range(N_STEPS):
+            out = talker_model(inputs_embeds=embed, past_key_values=past_kv,
+                               use_cache=True, return_dict=True)
+    torch.cuda.synchronize()
+    t_talker = (time.perf_counter() - t0) / N_STEPS * 1000
+
+    logger.info(f"  Predictor (15 steps): {t_pred:.1f}ms/frame")
+    logger.info(f"  Talker backbone (1 step, 28L): {t_talker:.1f}ms/frame")
+    logger.info(f"  Total per frame: ~{t_pred + t_talker:.1f}ms → ~{1000/(t_pred+t_talker):.1f} frames/s")
+    logger.info(f"  Theoretical RTF at this speed: {(t_pred+t_talker)/80:.3f} (target <0.15 = <12ms/frame)")
 
 
 def stage4_vocoder(backend, frames):
@@ -269,6 +330,11 @@ def main():
 
     # Stage 3: Full decode to EOS
     frames = stage3_eos(backend)
+
+    logger.info("\n" + "="*60)
+
+    # Stage 3b: Micro-timing — predictor vs talker split
+    stage3b_timing(backend)
 
     logger.info("\n" + "="*60)
 
