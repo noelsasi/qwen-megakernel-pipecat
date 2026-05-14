@@ -94,7 +94,7 @@ async def websocket_endpoint(websocket: WebSocket):
         )
 
         stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
-        llm = OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini")
+        llm = OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o")
         tts = QwenTTSService(backend=_tts_backend, sample_rate=_tts_backend.sample_rate)
 
         context = LLMContext(messages=[{"role": "system", "content": SYSTEM_PROMPT}])
