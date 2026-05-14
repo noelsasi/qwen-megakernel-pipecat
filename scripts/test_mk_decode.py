@@ -91,8 +91,8 @@ def check_single_step():
     attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     mlp_intermediate = torch.zeros(VOCAB_SIZE * 2, dtype=torch.bfloat16, device="cuda")
     normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-    block_max_vals = torch.full((8,), float("-inf"), dtype=torch.float32, device="cuda")
-    block_max_idxs = torch.zeros(8, dtype=torch.int32, device="cuda")
+    block_max_vals = torch.full((16,), float("-inf"), dtype=torch.float32, device="cuda")
+    block_max_idxs = torch.zeros(16, dtype=torch.int32, device="cuda")
     output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     attn_scale = float(HEAD_DIM ** -0.5)

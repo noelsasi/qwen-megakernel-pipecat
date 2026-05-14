@@ -186,18 +186,16 @@ class _MKDecoder:
         self._lm_head_weight = weights["lm_head_weight"]
         self._layer_weights_packed = _pack_layer_weights(weights["layer_weights"])
 
-        # Buffer dtypes confirmed from kernel.cu lines 1197-1201:
-        #   hidden_buffer → bfloat16
-        #   ALL others (activations, residual, q, k, v, attn_out, mlp_intermediate, normalized) → float32
+        # Working buffers — passed as void* to kernel, sizes match diagnostic
         self._hidden = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        self._activations = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
-        self._residual = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
-        self._q = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
-        self._k = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
-        self._v = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
-        self._attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.float32, device="cuda")
-        self._mlp_intermediate = torch.zeros(VOCAB_SIZE, dtype=torch.float32, device="cuda")
-        self._normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        self._activations = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._residual = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._q = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        self._k = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        self._v = torch.zeros(NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        self._attn_out = torch.zeros(NUM_Q_HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        self._mlp_intermediate = torch.zeros(VOCAB_SIZE * 2, dtype=torch.bfloat16, device="cuda")
+        self._normalized = torch.zeros(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
         self._k_cache = torch.zeros(
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.bfloat16, device="cuda",
@@ -206,8 +204,8 @@ class _MKDecoder:
             NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM,
             dtype=torch.bfloat16, device="cuda",
         )
-        # block_max_vals/idxs: one entry per attention block (LDG_ATTN_BLOCKS=8 from build.py)
-        n_attn_blocks = 8
+        # LDG_ATTN_BLOCKS = NUM_Q_HEADS = 16 (confirmed from kernel.cu line 46)
+        n_attn_blocks = NUM_Q_HEADS
         self._block_max_vals = torch.full((n_attn_blocks,), float("-inf"), dtype=torch.float32, device="cuda")
         self._block_max_idxs = torch.zeros(n_attn_blocks, dtype=torch.int32, device="cuda")
         # output_token: single int32 tensor written by decode op
