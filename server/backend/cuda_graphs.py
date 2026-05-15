@@ -182,6 +182,7 @@ class TalkerGraph:
             if self.attn_mask is not None and position < len(self.attn_mask_table) and self.attn_mask_table[position] is not None:
                 self.attn_mask.copy_(self.attn_mask_table[position])
             self.graph.replay()
+        self._stream.synchronize()
         return self.output_buf, self.logits_buf
 
 
@@ -331,6 +332,7 @@ class PredictorGraph:
             self.input_buf.copy_(pred_input)
             self.static_cache.reset()
             self.graph.replay()
+        self._stream.synchronize()
         result = self.output_tokens.clone()
         result.clamp_(0, 2047)
         return result

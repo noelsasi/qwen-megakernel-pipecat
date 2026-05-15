@@ -432,7 +432,7 @@ def _custom_decode_loop(
     _suppress_mask[eos_id + 1:] = True
 
     def _sample(logits_1d: torch.Tensor, suppress_eos: bool) -> torch.Tensor:
-        logits_1d = logits_1d.clone()
+        logits_1d = logits_1d.clone().float()  # float32 for numerical stability
         logits_1d[_suppress_mask] = float("-inf")
         if suppress_eos:
             logits_1d[eos_id] = float("-inf")
@@ -441,7 +441,11 @@ def _custom_decode_loop(
             if top_k > 0:
                 topk_vals = torch.topk(logits_1d, min(top_k, logits_1d.size(-1))).values
                 logits_1d = logits_1d.masked_fill(logits_1d < topk_vals[-1], float("-inf"))
-            return torch.multinomial(torch.softmax(logits_1d, dim=-1), 1).squeeze()
+            probs = torch.softmax(logits_1d, dim=-1)
+            # Guard: if all probs are zero/nan (all-inf logits), fall back to argmax
+            if not torch.isfinite(probs).any() or probs.sum() == 0:
+                return logits_1d.nan_to_num(nan=0.0, neginf=0.0).argmax()
+            return torch.multinomial(probs, 1).squeeze()
         return logits_1d.argmax()
 
     def _run_predictor(pred_input: torch.Tensor) -> torch.Tensor:
@@ -806,7 +810,7 @@ class QwenTTSBackendV2:
                     talker_model=talker.model,
                     talker_config=self._config,
                     codec_head=talker.codec_head,
-                    max_seq_len=512,
+                    max_seq_len=2048,
                 )
                 self._talker_graph.capture()
 
