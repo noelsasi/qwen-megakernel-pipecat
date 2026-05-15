@@ -206,7 +206,14 @@ class _MKDecoder:
         Sentinel path: write inputs_embeds [1024] into hidden_buffer, call decode(-1).
         Kernel reads hidden_buffer as the embedding row (sentinel patch required).
         Returns next token id (argmax from kernel).
+
+        sync_before=True is required: the direct kernel resets d_barrier_counter/
+        d_barrier_sense on-device (block 0 only), but other blocks may still be
+        executing from the prior call when the reset happens — causing a barrier
+        deadlock. A host sync ensures all 128 blocks have fully exited before
+        the next call resets the counters.
         """
+        torch.cuda.synchronize()
         self._hidden.copy_(inputs_embeds.view(_MK_HIDDEN_SIZE))
         self._decode_op(
             self._output_token,
@@ -217,6 +224,7 @@ class _MKDecoder:
             _MK_MAX_SEQ_LEN,
             self._attn_scale,
         )
+        torch.cuda.synchronize()
         self._position += 1
         return int(self._output_token.item())
 
