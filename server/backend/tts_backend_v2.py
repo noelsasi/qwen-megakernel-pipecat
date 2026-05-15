@@ -578,32 +578,32 @@ def _custom_decode_loop(
         if mk_decoder is not None:
             # Megakernel sentinel path.
             # inputs_embeds [1, 1, 1024] → write into hidden_buffer → decode(-1)
-            # Kernel reads hidden_buffer as embedding row, runs 28-layer forward,
-            # writes new hidden to hidden_buffer, writes argmax token to output_token.
-            next_tok_id = mk_decoder.step_with_embed(inputs_embeds)
-            # _hidden is the raw residual stream — apply final RMSNorm to match
-            # what HF talker.model returns as last_hidden_state (normed output).
-            # Code predictor was trained on normed hidden states; feeding it the
-            # raw residual causes divergence within a few steps.
+            # Kernel runs 28-layer forward, writes final residual to hidden_buffer.
+            # We ignore the kernel's argmax (no suppress mask) and recompute the
+            # token ourselves with RMSNorm + lm_head + suppress mask + sampling.
+            mk_decoder.step_with_embed(inputs_embeds)
+
+            # Apply final RMSNorm to raw residual → normed hidden (matches HF last_hidden_state)
             _h = mk_decoder._hidden.float()
             _h = _h * torch.rsqrt(_h.pow(2).mean() + 1e-6)
             _h = (_h * mk_decoder._final_norm_weight.float()).to(torch.bfloat16)
             past_hidden = _h.view(1, 1, _MK_HIDDEN_SIZE)
+
+            # Recompute logits with lm_head and apply suppress mask + sampling
+            logits_mk = (mk_decoder._lm_head_weight @ _h).squeeze()  # [vocab_size]
+            token = _sample(logits_mk, suppress_eos=(step_idx + 1 < min_new_tokens))
+            next_tok_id = int(token.item())
+
             gen_step += 1
             step = step_idx + 1
             if step_idx < 10 or step_idx % 20 == 0:
                 logger.info(f"[v2/mk] step={step_idx} mk_token={next_tok_id} valid={0<=next_tok_id<vocab_size} pos={mk_decoder._position-1}")
-            suppress_eos = step < min_new_tokens
-            if next_tok_id == eos_id and not suppress_eos:
+            if next_tok_id == eos_id:
                 logger.info(f"[v2/mk] EOS fired at step {step_idx}")
                 if chunk_buffer and on_chunk is not None:
                     on_chunk(torch.stack(chunk_buffer))
                     chunk_buffer = []
                 break
-            if not (0 <= next_tok_id < vocab_size):
-                logger.error(f"[v2/mk] Out-of-range token {next_tok_id} at step {step_idx} — aborting decode")
-                break
-            token = torch.tensor(next_tok_id, dtype=torch.long, device=device)
         elif talker_graph is not None:
             hidden, logits = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)
             # No clone needed: past_hidden is consumed by predictor_graph.run() at the top
