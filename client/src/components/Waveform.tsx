@@ -1,13 +1,13 @@
 import { useEffect, useRef } from "react";
 
-interface Props { active: boolean }
+interface Props { active: boolean; color?: string }
 
-const BAR_COUNT = 48;
+const BAR_COUNT = 36;
 
-export default function Waveform({ active }: Props) {
+export default function Waveform({ active, color = "110,181,255" }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef  = useRef<number>(0);
-  const barsRef   = useRef<number[]>(Array(BAR_COUNT).fill(0.05));
+  const barsRef   = useRef<number[]>(Array(BAR_COUNT).fill(0));
   const timeRef   = useRef(0);
 
   useEffect(() => {
@@ -16,51 +16,47 @@ export default function Waveform({ active }: Props) {
     const ctx = canvas.getContext("2d")!;
 
     function draw() {
-      const W = canvas!.width = canvas!.offsetWidth * window.devicePixelRatio;
-      const H = canvas!.height = canvas!.offsetHeight * window.devicePixelRatio;
+      const dpr = window.devicePixelRatio || 1;
+      const W = canvas!.offsetWidth * dpr;
+      const H = canvas!.offsetHeight * dpr;
+      canvas!.width = W;
+      canvas!.height = H;
       ctx.clearRect(0, 0, W, H);
 
-      timeRef.current += 0.04;
+      timeRef.current += active ? 0.045 : 0.012;
       const t = timeRef.current;
-
       const bars = barsRef.current;
+
       for (let i = 0; i < BAR_COUNT; i++) {
-        const target = active
-          ? 0.1 + 0.9 * Math.abs(
-              Math.sin(t * 2.1 + i * 0.38) * 0.5 +
-              Math.sin(t * 3.7 + i * 0.22) * 0.3 +
-              Math.sin(t * 1.3 + i * 0.61) * 0.2
-            )
-          : 0.04 + 0.02 * Math.abs(Math.sin(t * 0.3 + i * 0.5));
-        bars[i] = bars[i] + (target - bars[i]) * 0.12;
+        const wave = active
+          ? 0.08 + 0.92 * Math.pow(Math.abs(
+              Math.sin(t * 1.8 + i * 0.42) * 0.55 +
+              Math.sin(t * 3.1 + i * 0.27) * 0.28 +
+              Math.sin(t * 0.9 + i * 0.68) * 0.17
+            ), 0.7)
+          : 0.02 + 0.05 * Math.abs(Math.sin(t * 0.4 + i * 0.6));
+        bars[i] += (wave - bars[i]) * (active ? 0.18 : 0.06);
       }
 
       const barW = W / BAR_COUNT;
-      const gap  = barW * 0.25;
-      const bW   = barW - gap;
+      const gap  = barW * 0.35;
+      const bW   = Math.max(1, barW - gap);
+      const cx   = W / 2;
 
       for (let i = 0; i < BAR_COUNT; i++) {
-        const h = bars[i] * H * 0.9;
+        const h = bars[i] * H * 0.85;
         const x = i * barW + gap / 2;
         const y = (H - h) / 2;
+        const distFromCenter = Math.abs((x + bW / 2) - cx) / cx;
+        const edgeFade = Math.pow(1 - distFromCenter * 0.6, 1.5);
+        const alpha = active
+          ? (0.15 + bars[i] * 0.75) * edgeFade
+          : 0.12 * edgeFade;
 
-        const alpha = active ? 0.15 + bars[i] * 0.85 : 0.25;
-        if (active) {
-          ctx.fillStyle = `rgba(0,212,255,${alpha})`;
-        } else {
-          ctx.fillStyle = `rgba(60,80,100,${alpha})`;
-        }
+        ctx.fillStyle = `rgba(${color},${alpha.toFixed(3)})`;
         ctx.beginPath();
-        ctx.roundRect(x, y, bW, h, 1);
+        ctx.roundRect(x, y, bW, Math.max(2, h), 2);
         ctx.fill();
-
-        // peak glow on active high bars
-        if (active && bars[i] > 0.6) {
-          ctx.fillStyle = `rgba(0,212,255,${(bars[i] - 0.6) * 0.8})`;
-          ctx.beginPath();
-          ctx.roundRect(x, y, bW, 2, 1);
-          ctx.fill();
-        }
       }
 
       frameRef.current = requestAnimationFrame(draw);
@@ -68,12 +64,12 @@ export default function Waveform({ active }: Props) {
 
     frameRef.current = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frameRef.current);
-  }, [active]);
+  }, [active, color]);
 
   return (
     <canvas
       ref={canvasRef}
-      style={{ width: "100%", height: 64, display: "block" }}
+      style={{ width: "100%", height: "100%", display: "block" }}
     />
   );
 }
