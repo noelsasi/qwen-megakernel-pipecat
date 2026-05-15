@@ -177,9 +177,22 @@ class _MKDecoder:
         self._block_max_idxs = torch.zeros(_MK_LM_NUM_BLOCKS, dtype=torch.int32, device="cuda")
         self._output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
         self._decode_op = torch.ops.qwen_megakernel_C.decode
-        # reset_barriers op — exposed after kernel rebuild with patch_kernel_barriers.py
-        # Falls back to cuda.synchronize() if not present (slower but correct)
-        self._reset_op = getattr(torch.ops.qwen_megakernel_C, 'reset_barriers', None)
+        # Load reset_barriers via ctypes — bypasses torch dispatch (no tensor args).
+        # reset_barriers() zeros d_barrier_counter/sense/kv_flag/attn_flag on host
+        # before each decode() call to prevent the barrier race in consecutive calls.
+        self._reset_barriers_fn = None
+        try:
+            import ctypes, glob
+            so_files = glob.glob(
+                os.path.expanduser("~/.cache/torch_extensions/*/qwen_megakernel_C/qwen_megakernel_C.so")
+            )
+            if so_files:
+                _lib = ctypes.CDLL(so_files[0])
+                _lib.reset_barriers.restype = None
+                _lib.reset_barriers.argtypes = []
+                self._reset_barriers_fn = _lib.reset_barriers
+        except Exception:
+            pass  # falls back to cuda.synchronize()
 
     def _call_args(self):
         return (
@@ -216,8 +229,8 @@ class _MKDecoder:
         1-127 that are still running atomicAdd from the prior call — causing deadlock
         on consecutive calls without a full host-side drain + reset.
         """
-        if self._reset_op is not None:
-            self._reset_op()
+        if self._reset_barriers_fn is not None:
+            self._reset_barriers_fn()
         else:
             torch.cuda.synchronize()
         self._hidden.copy_(inputs_embeds.view(_MK_HIDDEN_SIZE))
