@@ -71,12 +71,20 @@ export default function Dashboard() {
 
   // ── pipecat event hooks ──────────────────────────────────────────────────
   useRTVIClientEvent(RTVIEvent.Metrics, (data: unknown) => {
-    const m = data as Metrics;
-    setMetrics(m);
-    if (m.e2e_ms != null) {
-      setLatencyHistory(h => [...h.slice(-59), m.e2e_ms!]);
+    // Pipecat serializes MetricsFrame as { ttfb: [{processor, value}], processing: [{processor, value}] }
+    // where ttfb.value = TTFC in seconds, processing.value = total gen time in seconds.
+    const raw = data as Record<string, {processor: string; value: number}[]>;
+    const ttfb = raw?.ttfb?.find(d => d.processor === "QwenTTSService");
+    const proc = raw?.processing?.find(d => d.processor === "QwenTTSService");
+    if (!ttfb && !proc) return;
+    const ttfc_ms = ttfb ? ttfb.value * 1000 : null;
+    const e2e_ms = proc ? proc.value * 1000 : null;
+    const m: Metrics = { ttfc_ms, rtf: null, toks_per_s: null, e2e_ms };
+    setMetrics(prev => ({ ...prev, ...m }));
+    if (e2e_ms != null) {
+      setLatencyHistory(h => [...h.slice(-59), e2e_ms]);
     }
-    addLog("debug", `metrics ttfc=${m.ttfc_ms?.toFixed(0)}ms rtf=${m.rtf?.toFixed(3)} toks/s=${m.toks_per_s?.toFixed(0)}`);
+    addLog("debug", `metrics ttfc=${ttfc_ms?.toFixed(0)}ms e2e=${e2e_ms?.toFixed(0)}ms`);
   });
 
   useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => {
