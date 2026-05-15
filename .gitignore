@@ -1,19 +1,68 @@
+# ── Python ────────────────────────────────────────────────────────────────────
 .venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+
+# ── Build / compiled artifacts ────────────────────────────────────────────────
+build/
+dist/
+*.so
+*.o
+*.a
+*.out
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
 .env
 .env.local
+.env.*
+!.env.example
+
+# ── GPU / CUDA ────────────────────────────────────────────────────────────────
+# Megakernel is cloned + patched by setup_server.sh — do not commit
+qwen_megakernel/
+# JIT compile cache (torch.utils.cpp_extension.load)
+/root/.cache/torch_extensions/
+
+# ── Model weights / HuggingFace cache ─────────────────────────────────────────
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.pkl
+/root/.cache/huggingface/
+
+# ── Audio output (test files) ─────────────────────────────────────────────────
 *.wav
 *.mp3
+*.flac
+*.ogg
+/tmp/
+
+# ── Frontend ──────────────────────────────────────────────────────────────────
+client/node_modules/
+client/dist/
+client/.vite/
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Claude Code session files ─────────────────────────────────────────────────
+.claude/
+
+# ── Legacy script outputs ─────────────────────────────────────────────────────
 inspect_output.txt
 streaming_probe_output.txt
 compat_output.txt
 gpu_util.txt
-client/node_modules/
-client/dist/
-*.egg-info/
-build/
-dist/
-.DS_Store
-.claude/
+
+# ── Duplicate README ──────────────────────────────────────────────────────────
+README copy.md

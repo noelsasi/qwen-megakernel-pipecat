@@ -226,16 +226,20 @@ class _MKDecoder:
         Kernel reads hidden_buffer as the embedding row (sentinel patch required).
         Returns next token id (argmax from kernel).
 
-        reset_barriers() is called before each decode() to zero d_barrier_counter,
-        d_barrier_sense, d_kv_flag, d_attn_flag on the host side. This is required
-        because the direct kernel's on-device reset (block 0 only) races with blocks
-        1-127 that are still running atomicAdd from the prior call — causing deadlock
-        on consecutive calls without a full host-side drain + reset.
+        Barriers (d_barrier_counter/sense/kv_flag/attn_flag) must be zeroed before
+        each decode() call because the direct kernel's on-device reset races with
+        blocks 1-127 reading stale values from the prior call — deadlocking on the
+        second consecutive launch.  The GPU is idle here (previous step drained via
+        item()), so the synchronous memsets in reset_barriers() complete instantly.
         """
+        # Reset barriers. ctypes path preferred (direct symbol, no dispatch overhead).
+        # PyTorch op is an equivalent fallback. A bare cuda.synchronize() is NOT a
+        # valid fallback — it stalls but does not zero the barrier memory, so the
+        # second kernel launch would still deadlock.
         if self._reset_barriers_fn is not None:
             self._reset_barriers_fn()
         else:
-            torch.cuda.synchronize()
+            torch.ops.qwen_megakernel_C.reset_barriers()
         self._hidden.copy_(inputs_embeds.view(_MK_HIDDEN_SIZE))
         self._decode_op(
             self._output_token,
@@ -246,7 +250,7 @@ class _MKDecoder:
             _MK_MAX_SEQ_LEN,
             self._attn_scale,
         )
-        torch.cuda.synchronize()
+        # item() below forces the required CPU-GPU sync — no explicit synchronize needed.
         self._position += 1
         return int(self._output_token.item())
 
