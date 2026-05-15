@@ -7,29 +7,29 @@
 }
 
 :root {
-  --bg:          #0a0a0c;
-  --bg-surface:  rgba(255,255,255,0.03);
-  --bg-elevated: rgba(255,255,255,0.055);
-  --border:      rgba(255,255,255,0.07);
-  --border-soft: rgba(255,255,255,0.04);
+  --bg:          #f7f7f8;
+  --bg-surface:  rgba(0,0,0,0.03);
+  --bg-elevated: #ffffff;
+  --border:      rgba(0,0,0,0.08);
+  --border-soft: rgba(0,0,0,0.05);
 
-  --text-primary:   #f0f0f2;
-  --text-secondary: #8a8a9a;
-  --text-tertiary:  #4a4a5a;
+  --text-primary:   #111114;
+  --text-secondary: #5a5a6a;
+  --text-tertiary:  #9a9aaa;
 
-  --accent:       #6eb5ff;
-  --accent-dim:   rgba(110,181,255,0.08);
-  --accent-glow:  rgba(110,181,255,0.18);
+  --accent:       #2563eb;
+  --accent-dim:   rgba(37,99,235,0.08);
+  --accent-glow:  rgba(37,99,235,0.15);
 
-  --green:        #4ade80;
-  --green-dim:    rgba(74,222,128,0.08);
+  --green:        #16a34a;
+  --green-dim:    rgba(22,163,74,0.08);
 
-  --amber:        #fbbf24;
-  --red:          #f87171;
+  --amber:        #d97706;
+  --red:          #dc2626;
 
-  --orb-core:     #6eb5ff;
-  --orb-mid:      rgba(110,181,255,0.3);
-  --orb-outer:    rgba(110,181,255,0.06);
+  --orb-core:     #2563eb;
+  --orb-mid:      rgba(37,99,235,0.3);
+  --orb-outer:    rgba(37,99,235,0.06);
 
   --sans: 'DM Sans', system-ui, sans-serif;
   --mono: 'DM Mono', 'IBM Plex Mono', monospace;
@@ -60,8 +60,8 @@ html, body {
 /* ── scrollbar ── */
 ::-webkit-scrollbar { width: 3px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.12); }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
 
 /* ── keyframes ── */
 @keyframes orb-breathe {

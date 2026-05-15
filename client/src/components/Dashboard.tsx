@@ -40,25 +40,25 @@ function VoiceOrb({ state }: { state: "idle" | "listening" | "speaking" | "conne
   const size = 72;
 
   const coreColor = state === "speaking"
-    ? "rgba(110,181,255,0.95)"
+    ? "rgba(37,99,235,0.9)"
     : state === "listening"
-    ? "rgba(74,222,128,0.9)"
+    ? "rgba(22,163,74,0.85)"
     : state === "connecting"
-    ? "rgba(251,191,36,0.8)"
-    : "rgba(90,90,110,0.5)";
+    ? "rgba(217,119,6,0.75)"
+    : "rgba(180,180,195,0.6)";
 
   const glowColor = state === "speaking"
-    ? "rgba(110,181,255,0.25)"
+    ? "rgba(37,99,235,0.18)"
     : state === "listening"
-    ? "rgba(74,222,128,0.2)"
+    ? "rgba(22,163,74,0.15)"
     : state === "connecting"
-    ? "rgba(251,191,36,0.15)"
+    ? "rgba(217,119,6,0.12)"
     : "transparent";
 
   const ringColor = state === "speaking"
-    ? "rgba(110,181,255,0.15)"
+    ? "rgba(37,99,235,0.12)"
     : state === "listening"
-    ? "rgba(74,222,128,0.12)"
+    ? "rgba(22,163,74,0.1)"
     : "transparent";
 
   const pulseAnim = state === "speaking"
@@ -77,7 +77,6 @@ function VoiceOrb({ state }: { state: "idle" | "listening" | "speaking" | "conne
 
   return (
     <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
-      {/* outer pulse ring */}
       {(state === "speaking" || state === "listening") && (
         <>
           <div style={{
@@ -97,40 +96,38 @@ function VoiceOrb({ state }: { state: "idle" | "listening" | "speaking" | "conne
           }} />
         </>
       )}
-      {/* glow */}
       <div style={{
         position: "absolute",
-        inset: -16,
+        inset: -20,
         borderRadius: "50%",
         background: `radial-gradient(circle, ${glowColor} 0%, transparent 70%)`,
         pointerEvents: "none",
       }} />
-      {/* core orb */}
       <div style={{
         width: size,
         height: size,
         borderRadius: "50%",
-        background: `radial-gradient(circle at 38% 35%, ${coreColor}, ${coreColor.replace("0.9", "0.5").replace("0.95", "0.55").replace("0.8", "0.45").replace("0.5", "0.2")} 100%)`,
+        background: `radial-gradient(circle at 38% 35%, ${coreColor}, ${
+          coreColor.replace("0.9", "0.55").replace("0.85", "0.5").replace("0.75", "0.4").replace("0.6", "0.25")
+        } 100%)`,
         boxShadow: state !== "idle"
-          ? `0 0 32px ${glowColor}, 0 0 60px ${glowColor.replace("0.25", "0.1").replace("0.2", "0.08").replace("0.15", "0.06")}`
-          : "none",
+          ? `0 4px 24px ${glowColor}, 0 1px 4px rgba(0,0,0,0.1)`
+          : "0 1px 4px rgba(0,0,0,0.08)",
         animation: state === "connecting" ? connectAnim : breatheAnim,
         transition: "background 0.6s ease, box-shadow 0.6s ease",
         cursor: "pointer",
         position: "relative",
         zIndex: 1,
         border: state !== "idle"
-          ? `1px solid ${ringColor.replace("0.15", "0.3").replace("0.12", "0.25")}`
-          : "1px solid rgba(255,255,255,0.06)",
+          ? `1px solid ${ringColor.replace("0.12", "0.25").replace("0.1", "0.22")}`
+          : "1px solid rgba(0,0,0,0.08)",
       }} />
     </div>
   );
 }
 
 // ── message bubble ─────────────────────────────────────────────────────────
-function MessageBubble({ role, content, isLatest }: {
-  role: string; content: string; isLatest?: boolean;
-}) {
+function MessageBubble({ role, content }: { role: string; content: string }) {
   const isUser = role === "user";
   return (
     <div style={{
@@ -138,30 +135,23 @@ function MessageBubble({ role, content, isLatest }: {
       flexDirection: "column",
       alignItems: isUser ? "flex-end" : "flex-start",
       animation: "msg-enter 0.3s cubic-bezier(0.16,1,0.3,1) both",
-      gap: 4,
     }}>
       <div style={{
         maxWidth: "72%",
-        padding: isUser ? "10px 14px" : "12px 16px",
-        borderRadius: isUser
-          ? "18px 18px 4px 18px"
-          : "18px 18px 18px 4px",
-        background: isUser
-          ? "rgba(110,181,255,0.1)"
-          : "rgba(255,255,255,0.04)",
+        padding: "11px 15px",
+        borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
+        background: isUser ? "rgba(37,99,235,0.09)" : "#ffffff",
         border: isUser
-          ? "1px solid rgba(110,181,255,0.18)"
-          : "1px solid rgba(255,255,255,0.06)",
-        color: isUser ? "rgba(200,220,255,0.95)" : "rgba(240,240,242,0.9)",
+          ? "1px solid rgba(37,99,235,0.16)"
+          : "1px solid rgba(0,0,0,0.07)",
+        color: isUser ? "#1e3a8a" : "#111114",
         fontSize: 15,
-        lineHeight: 1.6,
+        lineHeight: 1.65,
         fontWeight: 400,
         letterSpacing: "-0.01em",
-        backdropFilter: "blur(12px)",
-        transition: "all 0.2s ease",
-        ...(isLatest && !isUser ? {
-          borderColor: "rgba(110,181,255,0.14)",
-        } : {}),
+        boxShadow: isUser
+          ? "none"
+          : "0 1px 3px rgba(0,0,0,0.05)",
       }}>
         {content}
       </div>
@@ -173,23 +163,19 @@ function MessageBubble({ role, content, isLatest }: {
 function MetricPill({ label, value, pass }: {
   label: string; value: string; pass?: boolean | null;
 }) {
-  const color = pass == null
-    ? "rgba(255,255,255,0.35)"
-    : pass
-    ? "rgba(74,222,128,0.7)"
-    : "rgba(248,113,113,0.7)";
+  const valueColor = pass == null
+    ? "#5a5a6a"
+    : pass ? "#16a34a" : "#dc2626";
   return (
     <span style={{
       fontFamily: "var(--mono)",
       fontSize: 11,
-      color: "rgba(255,255,255,0.4)",
-      letterSpacing: "0.01em",
       display: "inline-flex",
       alignItems: "center",
       gap: 4,
     }}>
-      <span style={{ color: "rgba(255,255,255,0.22)", fontSize: 10 }}>{label}</span>
-      <span style={{ color, fontVariantNumeric: "tabular-nums" }}>{value}</span>
+      <span style={{ color: "#9a9aaa" }}>{label}</span>
+      <span style={{ color: valueColor, fontVariantNumeric: "tabular-nums" }}>{value}</span>
     </span>
   );
 }
@@ -197,10 +183,10 @@ function MetricPill({ label, value, pass }: {
 // ── log line ───────────────────────────────────────────────────────────────
 function LogLine({ entry }: { entry: LogEntry }) {
   const colors: Record<string, string> = {
-    info:  "rgba(255,255,255,0.35)",
-    warn:  "rgba(251,191,36,0.6)",
-    error: "rgba(248,113,113,0.7)",
-    debug: "rgba(255,255,255,0.15)",
+    info:  "#5a5a6a",
+    warn:  "#d97706",
+    error: "#dc2626",
+    debug: "#9a9aaa",
   };
   return (
     <div style={{
@@ -212,38 +198,28 @@ function LogLine({ entry }: { entry: LogEntry }) {
       color: colors[entry.level],
       animation: "log-slide-in 0.15s ease both",
     }}>
-      <span style={{ color: "rgba(255,255,255,0.12)", flexShrink: 0 }}>{entry.ts}</span>
+      <span style={{ color: "#c0c0cc", flexShrink: 0 }}>{entry.ts}</span>
       <span style={{ wordBreak: "break-all" }}>{entry.msg}</span>
     </div>
   );
 }
 
-// ── connection button ──────────────────────────────────────────────────────
+// ── connect button ─────────────────────────────────────────────────────────
 function ConnectButton({ connected, onClick }: { connected: boolean; onClick: () => void }) {
   return (
     <button
       onClick={onClick}
       style={{
-        background: connected ? "rgba(248,113,113,0.08)" : "rgba(110,181,255,0.1)",
-        border: `1px solid ${connected ? "rgba(248,113,113,0.25)" : "rgba(110,181,255,0.25)"}`,
-        color: connected ? "rgba(248,113,113,0.85)" : "rgba(110,181,255,0.9)",
+        background: connected ? "rgba(220,38,38,0.06)" : "rgba(37,99,235,0.08)",
+        border: `1px solid ${connected ? "rgba(220,38,38,0.2)" : "rgba(37,99,235,0.2)"}`,
+        color: connected ? "#dc2626" : "#2563eb",
         padding: "7px 16px",
         borderRadius: 8,
-        fontSize: 12,
+        fontSize: 13,
         fontFamily: "var(--sans)",
         fontWeight: 500,
-        letterSpacing: "0.01em",
         cursor: "pointer",
         transition: "all 0.2s ease",
-        backdropFilter: "blur(8px)",
-      }}
-      onMouseEnter={e => {
-        (e.currentTarget as HTMLButtonElement).style.background = connected
-          ? "rgba(248,113,113,0.14)" : "rgba(110,181,255,0.16)";
-      }}
-      onMouseLeave={e => {
-        (e.currentTarget as HTMLButtonElement).style.background = connected
-          ? "rgba(248,113,113,0.08)" : "rgba(110,181,255,0.1)";
       }}
     >
       {connected ? "Disconnect" : "Connect"}
@@ -274,7 +250,6 @@ export default function Dashboard() {
     setLogs(prev => [...prev.slice(-99), { ts: now(), level, msg }]);
   }, []);
 
-  // ── events ─────────────────────────────────────────────────────────────
   useRTVIClientEvent(RTVIEvent.Metrics, (data: unknown) => {
     const raw = data as Record<string, { processor: string; value: number }[]>;
     const ttfb = raw?.ttfb?.find(d => d.processor === "QwenTTSService");
@@ -305,7 +280,7 @@ export default function Dashboard() {
   const prevState = useRef(transportState);
   useEffect(() => {
     if (prevState.current !== transportState) {
-      addLog("info", `${transportState}`);
+      addLog("info", transportState);
       prevState.current = transportState;
     }
   }, [transportState, addLog]);
@@ -322,56 +297,49 @@ export default function Dashboard() {
   const isConnecting = transportState === "connecting" || transportState === "authenticating";
 
   const handleToggle = async () => {
-    if (!connected) {
-      addLog("info", "Connecting…");
-      await pipecatClient.connect();
-    } else {
-      addLog("info", "Disconnecting…");
-      await pipecatClient.disconnect();
-    }
+    if (!connected) { addLog("info", "Connecting…"); await pipecatClient.connect(); }
+    else            { addLog("info", "Disconnecting…"); await pipecatClient.disconnect(); }
   };
 
   const orbState = isConnecting ? "connecting"
-    : isBotSpeaking ? "speaking"
-    : isUserSpeaking ? "listening"
-    : connected ? "idle"
+    : isBotSpeaking   ? "speaking"
+    : isUserSpeaking  ? "listening"
     : "idle";
 
   const statusText = isConnecting ? "Connecting…"
-    : isBotSpeaking ? "Speaking"
+    : isBotSpeaking  ? "Speaking"
     : isUserSpeaking ? "Listening"
-    : connected ? "Ready"
+    : connected      ? "Ready"
     : "Disconnected";
 
-  const statusColor = isConnecting ? "rgba(251,191,36,0.7)"
-    : isBotSpeaking ? "rgba(110,181,255,0.8)"
-    : isUserSpeaking ? "rgba(74,222,128,0.8)"
-    : connected ? "rgba(255,255,255,0.3)"
-    : "rgba(255,255,255,0.2)";
+  const statusColor = isConnecting  ? "#d97706"
+    : isBotSpeaking  ? "#2563eb"
+    : isUserSpeaking ? "#16a34a"
+    : connected      ? "#9a9aaa"
+    : "#c0c0cc";
 
   return (
     <div style={{
       display: "flex",
       flexDirection: "column",
       height: "100dvh",
-      background: "var(--bg)",
+      background: "#f7f7f8",
       overflow: "hidden",
       position: "relative",
     }}>
-
-      {/* ── ambient background glow ── */}
+      {/* ── ambient glow ── */}
       <div style={{
         position: "absolute",
-        top: "5%",
+        top: 0,
         left: "50%",
         transform: "translateX(-50%)",
-        width: 600,
-        height: 300,
+        width: 560,
+        height: 260,
         background: isBotSpeaking
-          ? "radial-gradient(ellipse, rgba(110,181,255,0.045) 0%, transparent 70%)"
+          ? "radial-gradient(ellipse, rgba(37,99,235,0.07) 0%, transparent 70%)"
           : isUserSpeaking
-          ? "radial-gradient(ellipse, rgba(74,222,128,0.035) 0%, transparent 70%)"
-          : "radial-gradient(ellipse, rgba(110,181,255,0.02) 0%, transparent 70%)",
+          ? "radial-gradient(ellipse, rgba(22,163,74,0.06) 0%, transparent 70%)"
+          : "none",
         pointerEvents: "none",
         transition: "background 0.8s ease",
         zIndex: 0,
@@ -385,64 +353,49 @@ export default function Dashboard() {
         padding: "0 28px",
         height: 56,
         flexShrink: 0,
-        borderBottom: "1px solid rgba(255,255,255,0.045)",
-        backdropFilter: "blur(20px)",
-        background: "rgba(10,10,12,0.7)",
+        borderBottom: "1px solid rgba(0,0,0,0.07)",
+        background: "rgba(247,247,248,0.85)",
+        backdropFilter: "blur(16px)",
         position: "relative",
         zIndex: 10,
       }}>
         {/* brand */}
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{
-            fontSize: 13,
-            fontWeight: 500,
-            color: "rgba(255,255,255,0.55)",
-            letterSpacing: "0.02em",
-          }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "#111114", letterSpacing: "-0.01em" }}>
             Qwen3 TTS
           </span>
-          <span style={{
-            width: 1,
-            height: 12,
-            background: "rgba(255,255,255,0.1)",
-          }} />
-          <span style={{
-            fontSize: 11,
-            color: "rgba(255,255,255,0.22)",
-            letterSpacing: "0.02em",
-            fontFamily: "var(--mono)",
-          }}>
+          <span style={{ width: 1, height: 13, background: "rgba(0,0,0,0.1)" }} />
+          <span style={{ fontSize: 11, color: "#9a9aaa", fontFamily: "var(--mono)" }}>
             megakernel
           </span>
         </div>
 
-        {/* center status */}
+        {/* status pill */}
         <div style={{
           display: "flex",
           alignItems: "center",
           gap: 7,
           padding: "5px 12px",
           borderRadius: 20,
-          background: "rgba(255,255,255,0.03)",
-          border: "1px solid rgba(255,255,255,0.06)",
+          background: "#ffffff",
+          border: "1px solid rgba(0,0,0,0.08)",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
         }}>
           <span style={{
             width: 6,
             height: 6,
             borderRadius: "50%",
             background: statusColor,
-            boxShadow: connected || isConnecting ? `0 0 6px ${statusColor}` : "none",
+            boxShadow: (connected || isConnecting) ? `0 0 5px ${statusColor}` : "none",
             animation: (isBotSpeaking || isUserSpeaking || isConnecting)
-              ? "status-fade 1.5s ease-in-out infinite"
-              : "none",
-            transition: "background 0.4s ease, box-shadow 0.4s ease",
+              ? "status-fade 1.5s ease-in-out infinite" : "none",
+            transition: "background 0.4s ease",
             flexShrink: 0,
           }} />
           <span style={{
             fontSize: 12,
             color: statusColor,
-            fontWeight: 450,
-            letterSpacing: "0.01em",
+            fontWeight: 500,
             transition: "color 0.4s ease",
           }}>
             {statusText}
@@ -455,28 +408,23 @@ export default function Dashboard() {
             <button
               onClick={() => enableMic(!isMicEnabled)}
               style={{
-                background: isMicEnabled
-                  ? "rgba(74,222,128,0.1)"
-                  : "rgba(255,255,255,0.04)",
-                border: `1px solid ${isMicEnabled ? "rgba(74,222,128,0.22)" : "rgba(255,255,255,0.08)"}`,
-                color: isMicEnabled
-                  ? "rgba(74,222,128,0.8)"
-                  : "rgba(255,255,255,0.3)",
-                padding: "6px 12px",
+                background: isMicEnabled ? "rgba(22,163,74,0.08)" : "#ffffff",
+                border: `1px solid ${isMicEnabled ? "rgba(22,163,74,0.25)" : "rgba(0,0,0,0.1)"}`,
+                color: isMicEnabled ? "#16a34a" : "#5a5a6a",
+                padding: "6px 13px",
                 borderRadius: 8,
                 fontSize: 12,
                 fontFamily: "var(--sans)",
-                fontWeight: 450,
+                fontWeight: 500,
                 cursor: "pointer",
                 transition: "all 0.2s ease",
                 display: "flex",
                 alignItems: "center",
-                gap: 6,
+                gap: 5,
+                boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
               }}
             >
-              <span style={{ fontSize: 10 }}>
-                {isMicEnabled ? "●" : "○"}
-              </span>
+              <span style={{ fontSize: 9 }}>{isMicEnabled ? "●" : "○"}</span>
               Mic
             </button>
           )}
@@ -484,7 +432,7 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* ── main conversation area ── */}
+      {/* ── main ── */}
       <main style={{
         flex: 1,
         display: "flex",
@@ -495,27 +443,24 @@ export default function Dashboard() {
         position: "relative",
         zIndex: 1,
       }}>
-
-        {/* orb + waveform zone */}
+        {/* orb + waveform */}
         <div style={{
           flexShrink: 0,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
-          gap: 20,
+          gap: 18,
           paddingTop: 36,
-          paddingBottom: 20,
+          paddingBottom: 16,
         }}>
           <VoiceOrb state={orbState} />
-
-          {/* waveform strip — only visible when bot speaking */}
           <div style={{
-            width: 240,
-            height: 36,
+            width: 220,
+            height: 32,
             opacity: isBotSpeaking ? 1 : 0,
             transition: "opacity 0.5s ease",
           }}>
-            <Waveform active={isBotSpeaking} />
+            <Waveform active={isBotSpeaking} color="37,99,235" />
           </div>
         </div>
 
@@ -523,13 +468,13 @@ export default function Dashboard() {
         <div style={{
           flex: 1,
           width: "100%",
-          maxWidth: 680,
+          maxWidth: 660,
           overflowY: "auto",
-          padding: "0 24px 20px",
+          padding: "4px 24px 24px",
           display: "flex",
           flexDirection: "column",
           gap: 10,
-          maskImage: "linear-gradient(to bottom, transparent 0%, black 6%, black 100%)",
+          maskImage: "linear-gradient(to bottom, transparent 0%, black 5%, black 100%)",
         }}>
           {(!messages || messages.length === 0) ? (
             <div style={{
@@ -537,10 +482,8 @@ export default function Dashboard() {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              color: "rgba(255,255,255,0.15)",
+              color: "#c0c0cc",
               fontSize: 14,
-              fontWeight: 400,
-              letterSpacing: "0.01em",
               paddingTop: 40,
               animation: "fade-in 0.8s ease both",
             }}>
@@ -555,7 +498,6 @@ export default function Dashboard() {
                   typeof p.text === "string" ? p.text
                     : (p.text as { spoken?: string })?.spoken ?? ""
                 ).join("")}
-                isLatest={i === messages.length - 1}
               />
             ))
           )}
@@ -563,25 +505,26 @@ export default function Dashboard() {
         </div>
       </main>
 
-      {/* ── bottom bar — metrics + log toggle ── */}
+      {/* ── footer ── */}
       <footer style={{
         flexShrink: 0,
-        borderTop: "1px solid rgba(255,255,255,0.045)",
-        background: "rgba(10,10,12,0.8)",
-        backdropFilter: "blur(20px)",
+        borderTop: "1px solid rgba(0,0,0,0.07)",
+        background: "rgba(247,247,248,0.9)",
+        backdropFilter: "blur(16px)",
         position: "relative",
         zIndex: 10,
       }}>
-        {/* collapsible log panel */}
+        {/* collapsible logs */}
         {logsOpen && (
           <div style={{
-            borderBottom: "1px solid rgba(255,255,255,0.045)",
+            borderBottom: "1px solid rgba(0,0,0,0.06)",
             padding: "12px 28px",
-            maxHeight: 160,
+            maxHeight: 150,
             overflowY: "auto",
             display: "flex",
             flexDirection: "column",
             gap: 1,
+            background: "#ffffff",
             animation: "soft-slide-up 0.2s ease both",
           }}>
             {logs.slice(-20).map((l, i) => (
@@ -591,7 +534,7 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* footer strip */}
+        {/* metrics strip */}
         <div style={{
           display: "flex",
           alignItems: "center",
@@ -599,55 +542,33 @@ export default function Dashboard() {
           padding: "0 28px",
           height: 44,
         }}>
-          {/* metrics pills */}
-          <div style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 16,
-          }}>
-            <MetricPill
-              label="TTFC"
-              value={fmtMs(metrics.ttfc_ms)}
-              pass={metrics.ttfc_ms != null ? metrics.ttfc_ms < 60 : null}
-            />
-            <span style={{ color: "rgba(255,255,255,0.08)", fontSize: 10 }}>·</span>
-            <MetricPill
-              label="RTF"
-              value={fmtNum(metrics.rtf, 3)}
-              pass={metrics.rtf != null ? metrics.rtf < 0.15 : null}
-            />
-            <span style={{ color: "rgba(255,255,255,0.08)", fontSize: 10 }}>·</span>
-            <MetricPill
-              label="E2E"
-              value={fmtMs(metrics.e2e_ms)}
-              pass={metrics.e2e_ms != null ? metrics.e2e_ms < 500 : null}
-            />
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <MetricPill label="TTFC" value={fmtMs(metrics.ttfc_ms)}
+              pass={metrics.ttfc_ms != null ? metrics.ttfc_ms < 60 : null} />
+            <span style={{ color: "rgba(0,0,0,0.12)", fontSize: 11 }}>·</span>
+            <MetricPill label="RTF" value={fmtNum(metrics.rtf, 3)}
+              pass={metrics.rtf != null ? metrics.rtf < 0.15 : null} />
+            <span style={{ color: "rgba(0,0,0,0.12)", fontSize: 11 }}>·</span>
+            <MetricPill label="E2E" value={fmtMs(metrics.e2e_ms)}
+              pass={metrics.e2e_ms != null ? metrics.e2e_ms < 500 : null} />
           </div>
-
-          {/* right side: wordmark + log toggle */}
-          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
             <button
               onClick={() => setLogsOpen(o => !o)}
               style={{
                 background: "none",
                 border: "none",
-                color: logsOpen ? "rgba(255,255,255,0.3)" : "rgba(255,255,255,0.18)",
+                color: logsOpen ? "#5a5a6a" : "#9a9aaa",
                 fontSize: 11,
                 fontFamily: "var(--mono)",
                 cursor: "pointer",
                 padding: "3px 0",
-                letterSpacing: "0.02em",
                 transition: "color 0.2s ease",
               }}
             >
               {logsOpen ? "hide logs" : "logs"}
             </button>
-            <span style={{
-              fontFamily: "var(--mono)",
-              fontSize: 10,
-              color: "rgba(255,255,255,0.1)",
-              letterSpacing: "0.04em",
-            }}>
+            <span style={{ fontFamily: "var(--mono)", fontSize: 10, color: "#c0c0cc" }}>
               pipecat-ai
             </span>
           </div>
