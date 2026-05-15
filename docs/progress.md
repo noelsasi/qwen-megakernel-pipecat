@@ -4,6 +4,84 @@
 
 ---
 
+## 2026-05-15 — Session 9: Phase 3 Code Written (Not Yet GPU-Tested)
+
+### Current Status
+
+| Item | Status |
+|------|--------|
+| v2 decode loop (correct architecture) | ✅ Working on GPU — RTF 0.209, TTFC 135ms |
+| Megakernel sentinel integration code | ✅ Written locally — **not yet run on GPU** |
+| Kernel sentinel patch in `setup_server.sh` | ✅ Written — **not yet applied to live server** |
+| `V2_MEGAKERNEL=1` env gate in backend | ✅ Written |
+| Stage 6 validation in `test_v2_decode.py` | ✅ Written |
+| Megakernel tok/s with sentinel path | ❌ Unknown — needs GPU run |
+| TTFC / RTF with megakernel | ❌ Unknown — needs GPU run |
+| README performance table updated with mk numbers | ❌ Pending GPU results |
+| Demo recording | ❌ Not done |
+
+### What was written this session (local, not GPU-tested)
+
+**`server/backend/tts_backend_v2.py`** — three additions:
+
+1. `_MKDecoder` class + helpers (`_mk_extract_weights`, `_mk_pack_layer_weights`,
+   `_mk_build_rope_tables`) added at module level. Constants use `_MK_MAX_SEQ_LEN=1024`
+   (was 32768 in Phase 1 — that's why Session 6 got only 263 tok/s instead of ~1000).
+
+2. `mk_decoder` branch at the top of the talker backbone block in `_custom_decode_loop()`:
+   ```python
+   if mk_decoder is not None:
+       next_tok_id = mk_decoder.step_with_embed(inputs_embeds)
+       past_hidden = mk_decoder._hidden.view(1, 1, _MK_HIDDEN_SIZE).clone()
+   ```
+   `step_with_embed()` writes `inputs_embeds [1024 bf16]` into `_hidden`, calls
+   `decode(-1)` (sentinel), reads argmax token back. No logit exposure — kernel does
+   argmax internally. TalkerGraph and eager branches unchanged below it.
+
+3. `_setup_megakernel()` and wiring in `__init__`, `_run_custom_decode()`,
+   `_decode_thread()`. `PredictorGraph` stays active regardless — code predictor
+   is independent of backbone choice.
+
+**`scripts/setup_server.sh`** — three kernel patches added (all idempotent):
+- Patch 1: `LDG_VOCAB_SIZE 151936 → 3072` (already existed)
+- Patch 2: Sentinel ternary on the `embed_row` assignment — Python regex replacement
+- Patch 3: `MAX_SEQ_LEN 32768 → 1024` — reduces KV alloc from 1.88GB to 118MB
+
+**`scripts/test_v2_decode.py`** — Stage 6 added:
+- Sub-test A: `step_with_embed(zeros)` in isolation — verifies sentinel doesn't crash
+- Sub-test B: full decode to EOS with megakernel + PredictorGraph — measures tok/s, RTF, EOS
+
+### What must happen on GPU before submission
+
+**In order, stop if any step fails:**
+
+1. `bash scripts/setup_server.sh` — watch for sentinel patch output:
+   - ✅ `kernel.cu: sentinel patch applied (embed_row ternary)`
+   - ❌ `ERROR: Could not find embed_row line` → inspect kernel.cu manually, patch by hand
+
+2. `V2_MEGAKERNEL=1 python scripts/test_v2_decode.py`:
+   - Stage 6 Sub-test A must pass (kernel doesn't crash on sentinel)
+   - Stage 6 Sub-test B must show EOS within 200 frames and valid unique tokens
+
+3. Update README performance table with real megakernel numbers from Stage 6
+
+4. Update Known Limitations section once real numbers are known
+
+5. `V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn ...` — confirm end-to-end voice pipeline works
+
+6. Record demo
+
+### Known risks going into GPU run
+
+| Risk | Mitigation |
+|------|-----------|
+| Sentinel patch regex misses actual line | Script prints found `embed_row` lines on failure; patch manually |
+| Kernel crashes on `decode(-1)` | Sub-test A catches this before any decode logic runs |
+| EOS doesn't fire (sequence diverges) | v2 builds correct `inputs_embeds`; most likely cause is RoPE mismatch — `inv_freq` copied directly from HF model should prevent this |
+| `MAX_SEQ_LEN=1024` too small for some sentences | Prefill for long text could exceed 1024; `load_kv_from_hf()` raises explicitly — bump to 2048 if hit |
+
+---
+
 ## 2026-05-15 — Session 8: Alignment Review + Phase 3 Plan
 
 ### Alignment Review Findings

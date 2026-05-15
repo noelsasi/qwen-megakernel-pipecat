@@ -135,14 +135,14 @@ class TalkerGraph:
 
         print("[TalkerGraph] Capturing CUDA graph...")
         self.graph = torch.cuda.CUDAGraph()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        self._stream = torch.cuda.Stream()
+        self._stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._stream):
             self._decode_step()  # warmup in capture stream
             torch.cuda.synchronize()
             with torch.cuda.graph(self.graph):
                 self._decode_step()
-        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.current_stream().wait_stream(self._stream)
         torch.cuda.synchronize()
         self.captured = True
         print("[TalkerGraph] CUDA graph captured.")
@@ -150,22 +150,21 @@ class TalkerGraph:
     @torch.inference_mode()
     def prefill_kv(self, past_key_values) -> int:
         """
-        Copy HF DynamicCache → StaticCache.
-        Must run under inference_mode because StaticCache tensors were created
-        inside inference_mode during capture and cannot be mutated outside it.
-        past_key_values: DynamicCache with .layers[i].keys/values
-        Returns: prefill seq_len
+        Copy HF DynamicCache → StaticCache on the capture stream.
+        Must run on the same stream the graph was captured on — otherwise the
+        graph replay and the KV writes race across streams.
         """
-        self.static_cache.reset()
-        seq_len = 0
-        for li in range(self.num_layers):
-            layer = past_key_values.layers[li]
-            k = layer.keys   # [1, kv_heads, seq_len, head_dim]
-            v = layer.values
-            seq_len = k.shape[2]
-            cache_pos = torch.arange(seq_len, device=self.device)
-            self.static_cache.update(k.to(self.dtype), v.to(self.dtype), li,
-                                     {"cache_position": cache_pos})
+        with torch.cuda.stream(self._stream):
+            self.static_cache.reset()
+            seq_len = 0
+            for li in range(self.num_layers):
+                layer = past_key_values.layers[li]
+                k = layer.keys   # [1, kv_heads, seq_len, head_dim]
+                v = layer.values
+                seq_len = k.shape[2]
+                cache_pos = torch.arange(seq_len, device=self.device)
+                self.static_cache.update(k.to(self.dtype), v.to(self.dtype), li,
+                                         {"cache_position": cache_pos})
         return seq_len
 
     @torch.inference_mode()
@@ -177,11 +176,12 @@ class TalkerGraph:
         Returns: (hidden [1,1,hidden], logits [1,vocab]) if codec_head captured,
                  else (hidden [1,1,hidden], None)
         """
-        self.input_buf.copy_(input_embeds)
-        self.cache_position[0] = position
-        if self.attn_mask is not None and position < len(self.attn_mask_table) and self.attn_mask_table[position] is not None:
-            self.attn_mask.copy_(self.attn_mask_table[position])
-        self.graph.replay()
+        with torch.cuda.stream(self._stream):
+            self.input_buf.copy_(input_embeds)
+            self.cache_position[0] = position
+            if self.attn_mask is not None and position < len(self.attn_mask_table) and self.attn_mask_table[position] is not None:
+                self.attn_mask.copy_(self.attn_mask_table[position])
+            self.graph.replay()
         return self.output_buf, self.logits_buf
 
 
@@ -306,16 +306,16 @@ class PredictorGraph:
 
         print("[PredictorGraph] Capturing CUDA graph...")
         self.graph = torch.cuda.CUDAGraph()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        self._stream = torch.cuda.Stream()
+        self._stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._stream):
             self.static_cache.reset()
             self._full_loop()
             torch.cuda.synchronize()
             self.static_cache.reset()
             with torch.cuda.graph(self.graph):
                 self._full_loop()
-        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.current_stream().wait_stream(self._stream)
         torch.cuda.synchronize()
         self.captured = True
         print("[PredictorGraph] CUDA graph captured.")
@@ -323,16 +323,14 @@ class PredictorGraph:
     @torch.inference_mode()
     def run(self, pred_input: torch.Tensor) -> torch.Tensor:
         """
-        Run captured 15-step loop.
+        Run captured 15-step loop on the capture stream.
         pred_input: [1, 2, talker_hidden_size]
         Returns: [15] long tensor — CB1..CB15 token IDs, clamped to [0, 2047]
         """
-        self.input_buf.copy_(pred_input)
-        self.static_cache.reset()  # must be under inference_mode
-        self.graph.replay()
-        # Clamp output: graph output_tokens buffer could have stale/garbage values
-        # on first run or if sampling produces out-of-range indices.
-        # Predictor vocab = 2048 (each codebook has 2048 entries).
+        with torch.cuda.stream(self._stream):
+            self.input_buf.copy_(pred_input)
+            self.static_cache.reset()
+            self.graph.replay()
         result = self.output_tokens.clone()
         result.clamp_(0, 2047)
         return result
