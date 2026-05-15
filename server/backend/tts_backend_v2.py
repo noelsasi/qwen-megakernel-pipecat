@@ -581,17 +581,27 @@ def _custom_decode_loop(
             # Kernel reads hidden_buffer as embedding row, runs 28-layer forward,
             # writes new hidden to hidden_buffer, writes argmax token to output_token.
             next_tok_id = mk_decoder.step_with_embed(inputs_embeds)
-            past_hidden = mk_decoder._hidden.view(1, 1, _MK_HIDDEN_SIZE).clone()
+            # _hidden is the raw residual stream — apply final RMSNorm to match
+            # what HF talker.model returns as last_hidden_state (normed output).
+            # Code predictor was trained on normed hidden states; feeding it the
+            # raw residual causes divergence within a few steps.
+            _h = mk_decoder._hidden.float()
+            _h = _h * torch.rsqrt(_h.pow(2).mean() + 1e-6)
+            _h = (_h * mk_decoder._final_norm_weight.float()).to(torch.bfloat16)
+            past_hidden = _h.view(1, 1, _MK_HIDDEN_SIZE)
             gen_step += 1
             step = step_idx + 1
-            if step_idx < 5 or step_idx % 20 == 0:
-                logger.debug(f"[v2/mk] step={step_idx} mk_token={next_tok_id} pos={mk_decoder._position-1}")
+            if step_idx < 10 or step_idx % 20 == 0:
+                logger.info(f"[v2/mk] step={step_idx} mk_token={next_tok_id} valid={0<=next_tok_id<vocab_size} pos={mk_decoder._position-1}")
             suppress_eos = step < min_new_tokens
             if next_tok_id == eos_id and not suppress_eos:
                 logger.info(f"[v2/mk] EOS fired at step {step_idx}")
                 if chunk_buffer and on_chunk is not None:
                     on_chunk(torch.stack(chunk_buffer))
                     chunk_buffer = []
+                break
+            if not (0 <= next_tok_id < vocab_size):
+                logger.error(f"[v2/mk] Out-of-range token {next_tok_id} at step {step_idx} — aborting decode")
                 break
             token = torch.tensor(next_tok_id, dtype=torch.long, device=device)
         elif talker_graph is not None:
@@ -849,7 +859,7 @@ class QwenTTSBackendV2:
                 self._talker_graph.capture()
 
         except Exception as e:
-            logger.warning(f"[v2] CUDA graph capture failed ({e}), falling back to eager")
+            logger.warning(f"[v2] CUDA graph capture failed ({e}), falling back to eager", exc_info=True)
             self._talker_graph = None
             self._predictor_graph = None
 
