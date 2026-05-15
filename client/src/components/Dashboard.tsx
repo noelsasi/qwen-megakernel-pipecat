@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   usePipecatClientTransportState,
   usePipecatClientMicControl,
-  usePipecatConversation,
   useRTVIClientEvent,
 } from "@pipecat-ai/client-react";
 import { RTVIEvent } from "@pipecat-ai/client-js";
@@ -18,6 +17,12 @@ interface LogEntry {
   ts: string;
   level: "info" | "warn" | "error" | "debug";
   msg: string;
+}
+interface Turn {
+  id: number;
+  role: "user" | "bot";
+  text: string;
+  final: boolean;
 }
 
 function now() { return new Date().toISOString().slice(11, 19); }
@@ -69,7 +74,7 @@ function Orb({ state }: { state: "idle" | "listening" | "speaking" | "connecting
 
 // ─── Message ──────────────────────────────────────────────────────────────
 function Message({ role, content }: { role: string; content: string }) {
-  const isUser = role === "user";
+  const isUser = role === "user" || role === "human";
   return (
     <div style={{
       display: "flex",
@@ -154,13 +159,14 @@ function LogEntry({ entry }: { entry: LogEntry }) {
 export default function Dashboard() {
   const transportState = usePipecatClientTransportState();
   const { isMicEnabled, enableMic } = usePipecatClientMicControl();
-  const { messages } = usePipecatConversation();
 
   const [metrics, setMetrics] = useState<Metrics>({ ttfc_ms: null, rtf: null, e2e_ms: null });
   const [logs, setLogs] = useState<LogEntry[]>([{ ts: now(), level: "info", msg: "Waiting for connection" }]);
   const [isBotSpeaking, setIsBotSpeaking] = useState(false);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [panel, setPanel] = useState<"none" | "metrics" | "logs">("none");
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const turnIdRef = useRef(0);
 
   const transcriptEnd = useRef<HTMLDivElement>(null);
   const logsEnd = useRef<HTMLDivElement>(null);
@@ -181,8 +187,50 @@ export default function Dashboard() {
     }));
   });
 
-  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => { setIsBotSpeaking(true);  addLog("info", "Bot speaking"); });
-  useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking,  () => { setIsBotSpeaking(false); addLog("info", "Bot done"); });
+  // Build transcript from raw transcript events — correct ordering guaranteed
+  useRTVIClientEvent(RTVIEvent.UserTranscript, (data: unknown) => {
+    const { text, final } = data as { text: string; final: boolean };
+    if (!text?.trim()) return;
+    setTurns(prev => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === "user" && !last.final) {
+        // update in-progress user turn
+        return [...prev.slice(0, -1), { ...last, text, final }];
+      }
+      if (!final && last?.role === "user") return prev; // skip interim if already final
+      return [...prev, { id: ++turnIdRef.current, role: "user", text, final }];
+    });
+  });
+
+  useRTVIClientEvent(RTVIEvent.BotOutput, (data: unknown) => {
+    const text = typeof data === "string" ? data : (data as { text?: string })?.text ?? "";
+    if (!text?.trim()) return;
+    setTurns(prev => {
+      const last = prev[prev.length - 1];
+      // Append to in-progress bot turn or start new one
+      if (last && last.role === "bot" && !last.final) {
+        return [...prev.slice(0, -1), { ...last, text: last.text + text }];
+      }
+      return [...prev, { id: ++turnIdRef.current, role: "bot", text, final: false }];
+    });
+  });
+
+  useRTVIClientEvent(RTVIEvent.BotStartedSpeaking, () => {
+    setIsBotSpeaking(true);
+    addLog("info", "Bot speaking");
+  });
+  useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, () => {
+    setIsBotSpeaking(false);
+    addLog("info", "Bot done");
+    // Mark last bot turn as final
+    setTurns(prev => {
+      const last = prev[prev.length - 1];
+      if (last?.role === "bot" && !last.final) {
+        return [...prev.slice(0, -1), { ...last, final: true }];
+      }
+      return prev;
+    });
+  });
   useRTVIClientEvent(RTVIEvent.UserStartedSpeaking, () => { setIsUserSpeaking(true);  addLog("debug", "User speaking"); });
   useRTVIClientEvent(RTVIEvent.UserStoppedSpeaking,  () => { setIsUserSpeaking(false); });
 
@@ -194,15 +242,21 @@ export default function Dashboard() {
     }
   }, [transportState, addLog]);
 
-  useEffect(() => { transcriptEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => { transcriptEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [turns]);
   useEffect(() => { if (panel === "logs") logsEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [logs, panel]);
 
   const connected = transportState === "ready" || transportState === "connected";
   const isConnecting = transportState === "connecting" || transportState === "authenticating";
 
   const handleToggle = async () => {
-    if (!connected) { addLog("info", "Connecting…"); await pipecatClient.connect(); }
-    else { addLog("info", "Disconnecting…"); await pipecatClient.disconnect(); }
+    if (!connected) {
+      setTurns([]);
+      addLog("info", "Connecting…");
+      await pipecatClient.connect();
+    } else {
+      addLog("info", "Disconnecting…");
+      await pipecatClient.disconnect();
+    }
   };
 
   const orbState = isConnecting ? "connecting"
@@ -309,7 +363,7 @@ export default function Dashboard() {
             display: "flex", flexDirection: "column", gap: 8,
             width: "100%", maxWidth: 640, margin: "0 auto", padding: "8px 24px 24px",
           }}>
-            {(!messages || messages.length === 0) ? (
+            {turns.length === 0 ? (
               <div style={{
                 flex: 1, display: "flex", flexDirection: "column",
                 alignItems: "center", justifyContent: "center",
@@ -321,15 +375,8 @@ export default function Dashboard() {
                 </span>
               </div>
             ) : (
-              messages.map((msg, i) => (
-                <Message
-                  key={i}
-                  role={msg.role}
-                  content={msg.parts.map(p =>
-                    typeof p.text === "string" ? p.text
-                      : (p.text as { spoken?: string })?.spoken ?? ""
-                  ).join("")}
-                />
+              turns.map(turn => (
+                <Message key={turn.id} role={turn.role} content={turn.text} />
               ))
             )}
             <div ref={transcriptEnd} />
