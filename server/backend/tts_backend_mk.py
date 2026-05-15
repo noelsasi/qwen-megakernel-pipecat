@@ -287,15 +287,6 @@ class _MKDecoder:
         self._position += 1
         return result
 
-    def generate_n(self, first_token_id: int, num_steps: int) -> list[int]:
-        """Run num_steps decode steps. Returns list of token ids."""
-        tokens = []
-        current = first_token_id
-        for _ in range(num_steps):
-            current = self.step(current)
-            tokens.append(current)
-        return tokens
-
     def load_kv_cache_from_hf(self, past_key_values) -> int:
         """
         Copy HF DynamicCache into megakernel's pre-allocated KV cache tensors.

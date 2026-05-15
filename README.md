@@ -72,9 +72,29 @@ Both hot paths captured using `transformers.StaticCache`:
 
 ### Megakernel path (V2_MEGAKERNEL=1)
 
-When enabled, the talker backbone step uses `torch.ops.qwen_megakernel_C.decode` with a sentinel token (`-1`) that reads the pre-built `inputs_embeds` directly from the hidden buffer, bypassing the embedding lookup table. This lets the correct summed 16-codebook embedding pass through the kernel.
+When enabled, the talker backbone step uses `torch.ops.qwen_megakernel_C.decode` with a sentinel token (`-1`) that reads the pre-built `inputs_embeds` directly from the hidden buffer, bypassing the embedding lookup table. This lets the correct summed 16-codebook embedding pass through the kernel's 28-layer fused transformer.
 
-Key implementation detail: the kernel's raw residual output (`_hidden`) is NOT equivalent to HF's `last_hidden_state`. The code predictor expects a normed hidden state. After each kernel call, we apply RMSNorm manually and recompute logits through `lm_head` with the suppress mask — so sampling, EOS detection, and code predictor input are all correct.
+**What the megakernel actually computes** (from `kernel.cu` source inspection):
+
+The kernel launches two back-to-back CUDA kernels per step:
+1. `ldg_decode_kernel_direct` (128 blocks × 512 threads) — embedding lookup → 28 transformer layers (RMSNorm, QKV, RoPE, GQA attention, O-proj, SiLU-gated MLP, residual) → final RMSNorm → `g_normalized`
+2. `ldg_lm_head_fused` (1184 blocks × 256 threads) — greedy argmax over `g_normalized @ lm_head_weight.T` → writes `*output_token`
+
+We use the full output of kernel (1) and discard the output of kernel (2).
+
+**Why the kernel's argmax is discarded — correctness, not preference:**
+
+The kernel's lm_head argmax is a raw greedy max over all 3072 logits with no masking. Qwen3-TTS requires suppressing tokens `[2048..2149]` and `[2151..3071]` — only EOS (token 2150) is valid in that range. Without this mask, high-frequency tokens like 122 and 2035 win consistently and EOS is never reached (confirmed empirically: sequences loop indefinitely without the suppress mask). This is a functional correctness requirement, not a quality preference.
+
+After each kernel call, Python recomputes the token:
+```
+_hidden (raw residual) → RMSNorm → lm_head matmul [3072,1024]@[1024] → suppress mask → sampling
+```
+The lm_head matmul over 3072 tokens costs ~0.05ms — negligible on a 5090. No additional CPU sync is introduced beyond the `token.item()` sync already required to feed the next codec embedding.
+
+**Why `generate_nosync` (the fully GPU-side N-step path) cannot be used:**
+
+`torch.ops.qwen_megakernel_C.generate_nosync` runs N steps on-device with zero CPU round-trips by feeding each argmax output back as the next integer token input. This is architecturally incompatible with Qwen3-TTS for two reasons: (1) each decode step requires a Python-side code predictor pass (15 steps → 16 codebook tokens → summed float embedding) that cannot be expressed as an integer token ID, and (2) the suppress mask cannot be injected between steps without modifying the kernel. The only correct integration point is the per-step sentinel path we use.
 
 | Component | CUDA graph | Megakernel |
 |-----------|-----------|------------|
@@ -264,13 +284,27 @@ Megakernel targets `sm_120a` (RTX 5090 Blackwell) only. The v2 custom decode loo
 
 ---
 
-## Kernel Modifications (Phase 1, reference)
+## Kernel Modifications
 
-For the `megakernel` backend (not needed for v2):
+Required for `V2_MEGAKERNEL=1`. Applied by `scripts/setup_server.sh`.
 
-| Item | Default | Required | How |
-|------|---------|----------|-----|
-| `LDG_VOCAB_SIZE` | 151936 | **3072** | Patch `csrc/kernel.cu`, rebuild |
-| `MAX_SEQ_LEN` | 2048 | 32768 | Python constant, no rebuild |
-| `rope_theta` | 10000 | 1,000,000 | Python only |
-| RoPE type | (original) | Standard 1D | Python RoPE table, no rebuild |
+| Item | Default (upstream) | Required | Where |
+|------|-------------------|----------|-------|
+| `LDG_VOCAB_SIZE` | 151936 (text vocab) | **3072** (codec vocab) | `csrc/kernel.cu` — requires rebuild |
+| `MAX_SEQ_LEN` | 32768 | **1024** | `csrc/kernel.cu` — reduces KV alloc from 1.88 GB to 118 MB, recovers ~4× tok/s |
+| Sentinel path (`input_token_id == -1`) | not present | **read `hidden_buffer` as embedding** | `csrc/kernel.cu` embed lookup line, requires rebuild |
+| `rope_theta` | 10000 | 1,000,000 | Python RoPE table — no rebuild |
+| RoPE type | (original) | Standard 1D | Python RoPE table — no rebuild |
+
+The sentinel patch is the key change: one ternary in `kernel.cu` at the embedding lookup:
+```cuda
+// Before:
+const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+
+// After:
+const __nv_bfloat16 *embed_row =
+    (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
+                          : hidden_buffer;   // sentinel: caller pre-writes inputs_embeds here
+```
+
+This lets the float embedding (summed 16-codebook embed + text conditioning) pass through the full 28-layer fused transformer without requiring an integer token ID.

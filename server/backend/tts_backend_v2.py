@@ -863,44 +863,6 @@ class QwenTTSBackendV2:
             self._talker_graph = None
             self._predictor_graph = None
 
-    def _run_custom_decode(self, text: str) -> tuple[list, float]:
-        """
-        Run full custom decode. Returns (all_frames, decode_time_s).
-        Raises on error — caller handles fallback.
-        """
-        logger.info(f"[v2] Starting custom decode for: {text[:60]!r}")
-        t0 = time.perf_counter()
-
-        past_kv, past_hidden, gen_step, trailing, tts_pad, first_logits = \
-            _build_prefill_inputs_and_run(
-                self._hf, text, self._speaker, self._language
-            )
-
-        t_prefill = time.perf_counter() - t0
-        logger.info(f"[v2] Prefill done in {t_prefill*1000:.0f}ms, gen_step={gen_step}")
-
-        if self._mk_decoder is not None:
-            self._mk_decoder.reset()
-            self._mk_decoder.load_kv_from_hf(past_kv)
-        elif self._talker_graph is not None:
-            self._talker_graph.prefill_kv(past_kv)
-
-        frames = _custom_decode_loop(
-            talker=self._talker,
-            past_key_values=past_kv,
-            past_hidden=past_hidden,
-            gen_step=gen_step,
-            trailing_text_hiddens=trailing,
-            tts_pad_embed=tts_pad,
-            first_logits=first_logits,
-            config=self._config,
-            talker_graph=self._talker_graph if self._mk_decoder is None else None,
-            predictor_graph=self._predictor_graph,
-            mk_decoder=self._mk_decoder,
-        )
-
-        t_decode = time.perf_counter() - t0
-        return frames, t_decode
 
     def _run_hf_fallback(self, text: str) -> np.ndarray:
         """Pure HF inference — unchanged backup path."""

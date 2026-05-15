@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-05-15 — Architecture Fact-Check: Megakernel Integration Verdict
+
+Inspected upstream `kernel.cu` and `torch_bindings.cpp` source. Key findings:
+
+**What the megakernel actually computes per `decode()` call:**
+- `ldg_decode_kernel_direct`: embedding lookup (or sentinel read) → 28 transformer layers → final RMSNorm → `g_normalized`
+- `ldg_lm_head_fused`: `g_normalized @ lm_head_weight.T` → greedy argmax → `*output_token`
+
+Both kernels always launch. We use `_hidden` (transformer output) and discard `output_token` (argmax).
+
+**Why discarding the kernel's argmax is correct, not a gap:**
+The kernel has no suppress mask. For Qwen3-TTS, tokens `[2048..2149]` and `[2151..3071]` must be suppressed — only EOS (2150) is valid in that range. Without masking, tokens 122 and 2035 win and EOS is never reached (confirmed Session 10). The suppress mask is a hard correctness requirement. Python lm_head recompute over 3072 tokens costs ~0.05ms — not material.
+
+**Why `generate_nosync` (fully on-device N-step path) cannot be used:**
+`generate_nosync` feeds each argmax token ID back as the next step's integer input via `ldg_update_step`. Qwen3-TTS decode steps require a Python-side code predictor round-trip (15 steps → 16 codebook tokens → summed float embedding) between every talker step. This cannot be represented as an integer token feedback. Architecturally incompatible regardless of the suppress mask issue.
+
+**Verdict:** Current architecture (sentinel path + Python sampling) is correct and the only valid integration given the model's decode requirements. The megakernel provides its primary value — the fused 28-layer transformer — fully. Docs updated accordingly.
+
+---
+
 ## 2026-05-15 — Session 10: Megakernel Running, EOS Fix In Progress
 
 ### Current Status

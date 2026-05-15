@@ -7,7 +7,7 @@
 #   cp .env.example .env && nano .env   # fill OPENAI_API_KEY and DEEPGRAM_API_KEY
 #   source .venv/bin/activate
 #   set -a && source .env && set +a
-#   TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+#   V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
 
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,9 +48,9 @@ pip install -r requirements.txt --quiet
 pip install -U qwen-tts --quiet
 
 echo ""
-echo "=== [6/7] Megakernel (optional — only needed for TTS_BACKEND=megakernel) ==="
-# The v2 backend (TTS_BACKEND=v2) does NOT require the megakernel.
-# Build it anyway so the option is available.
+echo "=== [6/7] Megakernel (required for V2_MEGAKERNEL=1, the recommended path) ==="
+# The v2 backend uses the megakernel for the 28-layer talker forward when V2_MEGAKERNEL=1.
+# Falls back to TalkerGraph (CUDA graph of HF forward) if not built or flag not set.
 if [ ! -d "qwen_megakernel" ]; then
     git clone https://github.com/AlpinDale/qwen_megakernel
     echo "Cloned qwen_megakernel"
@@ -152,11 +152,15 @@ echo "    nano .env   # fill OPENAI_API_KEY and DEEPGRAM_API_KEY"
 echo ""
 echo " 2. Validate the v2 decode pipeline (takes ~2 min, includes CUDA graph warmup):"
 echo "    source .venv/bin/activate"
-echo "    python scripts/test_v2_decode.py"
+echo "    V2_MEGAKERNEL=1 python scripts/test_v2_decode.py   # all 6 stages including mk"
+echo "    # (without flag: stages 1-5 only, uses TalkerGraph fallback)"
 echo ""
-echo " 3. Start the server (v2 backend — custom decode loop + CUDA graphs):"
+echo " 3. Start the server (v2 + megakernel — recommended):"
 echo "    source .venv/bin/activate"
 echo "    set -a && source .env && set +a"
+echo "    V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000"
+echo ""
+echo "    Without megakernel (CUDA graph fallback, slower):"
 echo "    TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000"
 echo ""
 echo " 4. On your local machine, open SSH tunnel:"
@@ -167,11 +171,12 @@ echo "    cd client && npm install"
 echo "    VITE_WS_URL=ws://localhost:8000/ws npm run dev"
 echo "    # Open http://localhost:5173 → click CONNECT → speak"
 echo ""
-echo " Expected server startup time: ~30s (CUDA graph capture for talker + predictor)"
-echo " Expected performance: TTFC ~135ms, RTF ~0.21"
+echo " Expected server startup time: ~15s (megakernel load + PredictorGraph CUDA graph capture)"
+echo " Expected performance (V2_MEGAKERNEL=1): raw RTF ~0.126, streaming RTF ~0.158, TTFC ~120ms"
+echo " Expected performance (TalkerGraph fallback): RTF ~0.236, TTFC ~142ms"
 echo ""
 echo " Backend options (TTS_BACKEND env var):"
-echo "   v2          — custom decode loop + CUDA graphs (recommended)"
+echo "   v2          — custom decode loop, use with V2_MEGAKERNEL=1 (recommended)"
 echo "   hf          — pure HuggingFace baseline (slow, for comparison)"
 echo "   megakernel  — Phase 1 monkey-patch (deprecated, use v2)"
 echo "================================================================"

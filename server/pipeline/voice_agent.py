@@ -39,7 +39,7 @@ SYSTEM_PROMPT = (
 
 def _load_backend():
     global _tts_backend
-    backend_name = os.environ.get("TTS_BACKEND", "megakernel").lower()
+    backend_name = os.environ.get("TTS_BACKEND", "v2").lower()
 
     if backend_name == "v2":
         from server.backend.tts_backend_v2 import QwenTTSBackendV2

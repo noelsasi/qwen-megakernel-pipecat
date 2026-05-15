@@ -115,17 +115,17 @@ Text
 
 ---
 
-## 4. Why the Current v2 Loop is Correct (and what it's missing)
+## 4. Why the v2 Loop is Correct
 
 `tts_backend_v2.py` implements everything above correctly:
 - Prefill via `_build_prefill_inputs_and_run()` captures `trailing_text_hiddens`, `tts_pad_embed`, `past_hidden`, `first_logits`
 - `_custom_decode_loop()` calls code predictor, reconstructs 16-codebook embedding, applies text conditioning per step
 - EOS fires at token 2150 correctly
-- `TalkerGraph` captures `talker.model.forward(inputs_embeds=..., past_kv=...)` as a CUDA graph — ~3ms/step
+- Three backbone options, in priority order: megakernel sentinel path (`V2_MEGAKERNEL=1`), `TalkerGraph` CUDA graph, HF eager
 
-**What it's missing:** the megakernel is not in the hot path. `TalkerGraph` wraps HF's PyTorch forward, not `torch.ops.qwen_megakernel_C.decode`. The kernel exists, is built by `setup_server.sh`, and is tested in `tts_backend_mk.py` — but `tts_backend_mk.py` was abandoned because it used the wrong decode strategy (no code predictor).
+**With `V2_MEGAKERNEL=1`:** megakernel handles the 28-layer talker forward (~1ms/step). `TalkerGraph` is skipped. `PredictorGraph` remains active for the code predictor (independent of backbone choice). The kernel's argmax output is discarded; Python recomputes logits with the suppress mask. See section 6 for the implementation and section 5 for why this is the correct tradeoff.
 
-The correct integration point is inside `_custom_decode_loop()` at the talker backbone step (lines ~343-361 in `tts_backend_v2.py`).
+**Without `V2_MEGAKERNEL=1`:** `TalkerGraph` captures `talker.model.forward(inputs_embeds=..., StaticCache)` as a CUDA graph — ~3ms/step. This is the fallback path for non-5090 GPUs or when the megakernel extension is unavailable.
 
 ---
 
@@ -229,58 +229,52 @@ Token selection always goes through Python `_sample()` with the correct suppress
 
 ---
 
-## 6. What Changes in `_custom_decode_loop()` (Phase 3)
+## 6. What the Megakernel Path Actually Does (Implemented)
 
-Current talker backbone section (tts_backend_v2.py lines ~342-362):
+This section reflects the **implemented and verified** code in `tts_backend_v2.py`, not the original design plan. The implementation differs from the initial plan in one critical way: the kernel's argmax output is discarded.
 
-```python
-# CURRENT (TalkerGraph / HF eager)
-if talker_graph is not None:
-    hidden, logits = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)
-    past_hidden = hidden[:, -1:, :]
-    if logits is None:
-        logits = codec_head(hidden[:, -1, :])
-else:
-    backbone_out = talker_model(
-        inputs_embeds=inputs_embeds,
-        past_key_values=past_key_values,
-        use_cache=True, output_hidden_states=False, return_dict=True,
-    )
-    hidden = backbone_out.last_hidden_state
-    past_key_values = backbone_out.past_key_values
-    logits = codec_head(hidden[:, -1, :])
-    past_hidden = hidden[:, -1:, :].clone()
-```
+### What the kernel computes per step (from `kernel.cu` source)
 
-After Phase 3, a third branch replaces the above when megakernel is active:
+The `decode` op launches two back-to-back CUDA kernels:
+
+1. **`ldg_decode_kernel_direct`** (128 blocks × 512 threads): embedding lookup (or sentinel read) → 28 transformer layers (RMSNorm, QKV, RoPE, GQA attn, O-proj, MLP) → final RMSNorm → writes `g_normalized`
+2. **`ldg_lm_head_fused`** (1184 blocks × 256 threads): `g_normalized @ lm_head_weight.T` → parallel reduction argmax → writes `*output_token`
+
+Both kernels always run. We use the output of (1) via `_hidden` and discard `output_token` from (2).
+
+### Why the kernel's argmax is discarded — this is a correctness requirement
+
+The kernel does a raw greedy argmax over all 3072 logits with no masking. Qwen3-TTS requires suppressing tokens `[2048..2149]` and `[2151..3071]`; only EOS (token 2150) is valid in that range. Without the suppress mask, tokens like 122 and 2035 consistently win and EOS is never reached — the decoder loops forever. This was confirmed empirically in Session 10. The suppress mask is not optional.
+
+The alternative — fusing the suppress mask into `ldg_lm_head_fused` — would require modifying the kernel. The lm_head GEMV over 3072 tokens in Python costs ~0.05ms, which is not material. The correct tradeoff is to discard the kernel's argmax and recompute Python-side.
+
+### Implemented backbone block (tts_backend_v2.py lines 578–606)
 
 ```python
-# TARGET (megakernel sentinel path)
-elif mk_decoder is not None:
-    # Write inputs_embeds into hidden_buffer — kernel reads it as embedding
-    mk_decoder._hidden.copy_(inputs_embeds.view(HIDDEN_SIZE))
-    torch.ops.qwen_megakernel_C.decode(
-        mk_decoder._output_token,
-        -1,                          # sentinel
-        *mk_decoder._call_args(),
-        NUM_LAYERS,
-        mk_decoder._position,
-        MAX_SEQ_LEN,
-        mk_decoder._attn_scale,
-    )
-    mk_decoder._position += 1
-    # hidden_buffer now holds new hidden state
-    past_hidden = mk_decoder._hidden.view(1, 1, HIDDEN_SIZE).clone()
-    # output_token is argmax — use directly as next step's token
-    # (no logit sampling — megakernel does argmax internally)
-    token = mk_decoder._output_token.to(torch.long).squeeze()
-    # Skip the _sample() call at the bottom of the loop
-    continue  # → next codec frame
+if mk_decoder is not None:
+    mk_decoder.step_with_embed(inputs_embeds)   # sentinel=-1, runs both kernel phases
+
+    # Kernel's _hidden is raw post-layer-norm residual — NOT HF's last_hidden_state.
+    # Code predictor was trained on normed hidden states. Apply RMSNorm manually.
+    _h = mk_decoder._hidden.float()
+    _h = _h * torch.rsqrt(_h.pow(2).mean() + 1e-6)
+    _h = (_h * mk_decoder._final_norm_weight.float()).to(torch.bfloat16)
+    past_hidden = _h.view(1, 1, _MK_HIDDEN_SIZE)
+
+    # Recompute logits with suppress mask and sample — kernel's output_token discarded.
+    logits_mk = (mk_decoder._lm_head_weight @ _h).squeeze()   # [3072]
+    token = _sample(logits_mk, suppress_eos=(step_idx + 1 < min_new_tokens))
+    next_tok_id = int(token.item())
 ```
 
-**Note:** Because the kernel outputs the token directly (not logits), the normal
-`token = _sample(logits, ...)` at the bottom of the decode loop must be skipped
-for the megakernel path. The loop structure needs a flag or early-continue.
+### Why `generate_nosync` cannot be used
+
+`torch.ops.qwen_megakernel_C.generate_nosync` runs N steps on-device with a single CPU sync at the end — each step's argmax token is fed back as the next integer input via the `ldg_update_step` device kernel. This path is architecturally incompatible with Qwen3-TTS:
+
+1. Each decode step requires a Python-side code predictor pass (15 autoregressive steps → 16 codebook tokens → summed float embedding `[1024]`). This cannot be expressed as an integer token ID to feed back between kernel steps.
+2. The suppress mask cannot be injected between steps without kernel modification.
+
+The per-step sentinel path is the only architecturally correct integration point.
 
 ---
 
