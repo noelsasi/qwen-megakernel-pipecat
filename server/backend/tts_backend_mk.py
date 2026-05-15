@@ -220,7 +220,23 @@ class _MKDecoder:
         self._output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
 
         self._decode_op = torch.ops.qwen_megakernel_C.decode
-        # generate_nosync is not present in all builds — use step() loop instead
+        # Load reset_barriers via ctypes (same pattern as tts_backend_v2._MKDecoder).
+        # cuda.synchronize() is NOT a valid substitute — it stalls but doesn't zero
+        # d_barrier_counter/sense/kv_flag/attn_flag, so the second call deadlocks.
+        self._reset_barriers_fn = None
+        try:
+            import ctypes, glob, os
+            so_files = glob.glob(
+                os.path.expanduser("~/.cache/torch_extensions/*/qwen_megakernel_C/qwen_megakernel_C.so")
+            )
+            if so_files:
+                _lib = ctypes.CDLL(so_files[0], mode=ctypes.RTLD_GLOBAL)
+                _lib.reset_barriers.restype = None
+                _lib.reset_barriers.argtypes = []
+                self._reset_barriers_fn = _lib.reset_barriers
+                print("[MK] reset_barriers loaded via ctypes")
+        except Exception as e:
+            print(f"[MK] reset_barriers ctypes load failed ({e}), using torch op fallback")
 
     def _call_args(self):
         """Common buffer args shared by decode and generate_nosync."""
@@ -246,8 +262,16 @@ class _MKDecoder:
             self._block_max_idxs,
         )
 
+    def _reset_barriers(self):
+        """Zero barrier memory before each decode() call to prevent deadlock on consecutive calls."""
+        if self._reset_barriers_fn is not None:
+            self._reset_barriers_fn()
+        else:
+            torch.ops.qwen_megakernel_C.reset_barriers()
+
     def step(self, token_id: int) -> int:
         """Run one decode step. Returns next token id."""
+        self._reset_barriers()
         self._decode_op(
             self._output_token,
             token_id,
