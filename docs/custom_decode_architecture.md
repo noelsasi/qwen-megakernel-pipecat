@@ -196,24 +196,36 @@ Since we write before calling, the kernel gets our embedding; after return,
 
 After the megakernel step:
 ```python
-# hidden_buffer = decoder._hidden = [1024] bfloat16 — new hidden state
-# output_token  = decoder._output_token = [1] int32 — next CB0 token
+# hidden_buffer = decoder._hidden = [1024] bfloat16 — raw residual (NOT normed)
+# output_token  = decoder._output_token = [1] int32 — kernel argmax (DO NOT USE directly)
 
-# Extract for next iteration:
-past_hidden = decoder._hidden.view(1, 1, HIDDEN_SIZE).clone()  # [1, 1, 1024]
-# Logits are NOT directly available — kernel does argmax internally.
-# The output token IS the argmax result — no separate logit computation needed.
-# This means sampling (temperature/top_k) must happen inside the kernel, OR
-# we skip sampling and accept pure argmax from the megakernel.
+# Correct extraction for next iteration:
+_h = decoder._hidden.float()
+_h = _h * torch.rsqrt(_h.pow(2).mean() + 1e-6)      # RMSNorm
+_h = (_h * decoder._final_norm_weight.float()).to(torch.bfloat16)
+past_hidden = _h.view(1, 1, HIDDEN_SIZE)              # [1, 1, 1024] — normed, for code predictor
+
+# Recompute token with suppress mask:
+logits = (decoder._lm_head_weight @ _h).squeeze()    # [vocab_size]
+token = _sample(logits, suppress_eos=...)             # same path as HF/TalkerGraph
 ```
 
-**Important implication:** The megakernel does argmax internally — it does not expose raw logits.
-If we need temperature sampling, we have two options:
-1. Accept argmax only (do_sample=False) for the CB0 token from megakernel
-2. Expose logits from the kernel (requires additional kernel modification — separate lm_head output buffer)
+**Why NOT use decoder._output_token:** The kernel's argmax has no suppress mask.
+Tokens [2048..3071] except EOS=2150 should be suppressed — without this, high-frequency
+tokens win every step and EOS is never reached.
 
-**Recommended: start with argmax (do_sample=False for CB0).** The code predictor
-(CB1..CB15) still uses sampling. This is how `tts_backend_mk.py` already works.
+**Important implication (confirmed Session 10):** The megakernel does argmax internally with NO suppress mask.
+Accepting the kernel's argmax token directly causes infinite loops — tokens 122, 2035 etc. win every step
+and EOS=2150 is never reached.
+
+**Correct approach (implemented):** Ignore the kernel's `output_token`. After `step_with_embed()`:
+1. Apply RMSNorm to `_hidden`: `h = hidden * rsqrt(hidden.pow(2).mean() + 1e-6) * final_norm_weight`
+2. Recompute logits: `logits = lm_head_weight @ h`
+3. Run `_sample(logits, suppress_eos=...)` — same suppress mask as HF path
+4. Use sampled token as next CB0; use normed `h` as `past_hidden` for code predictor
+
+The kernel is used only for its 28-layer transformer forward pass (KV cache update + hidden state).
+Token selection always goes through Python `_sample()` with the correct suppress mask.
 
 ---
 

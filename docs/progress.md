@@ -4,6 +4,70 @@
 
 ---
 
+## 2026-05-15 — Session 10: Megakernel Running, EOS Fix In Progress
+
+### Current Status
+
+| Item | Status |
+|------|--------|
+| v2 CUDA graphs path | ✅ Working — RTF 0.236, TTFC 142ms |
+| Megakernel sentinel path (V2_MEGAKERNEL=1) | ✅ Running — RTF **0.124** (target met), 97 frames/s |
+| EOS fires in megakernel path | ❌ Not yet — fix pushed, pending GPU confirmation |
+| TTFC with megakernel | ❌ Not measured — blocked on EOS fix |
+| Audio quality with megakernel | ❌ Not verified — blocked on EOS fix |
+
+### What was confirmed on GPU this session
+
+- Stage 6 sub-test A: `step_with_embed(zeros)` → token 0, valid ✅
+- Stage 6 sub-test B: 200 frames in 2058ms = **97.2 frames/s, RTF 0.124** ✅ (target < 0.15 met)
+- Tokens are valid (all in [0, 3072)) but sequence doesn't reach EOS
+
+### Root causes found and fixed
+
+**Bug 1 — Kernel argmax bypasses suppress mask**
+The megakernel does argmax over raw logits internally — no suppress mask, no sampling.
+Tokens 2048-3071 (except EOS=2150) are supposed to be masked out. Without the mask,
+high-probability tokens like 122 and 2035 win every time → sequence loops forever.
+
+Fix (commit `5a417fe`): ignore the kernel's token output. After `step_with_embed()`,
+manually apply RMSNorm to `_hidden`, recompute logits via `lm_head`, run through
+`_sample()` with the suppress mask. Kernel is used only for its 28-layer forward pass.
+
+**Bug 2 — Raw residual fed to code predictor**
+The kernel's `_hidden` buffer is the raw post-layer-norm residual stream, not HF's
+`last_hidden_state` (which goes through `model.norm` RMSNorm before return). The code
+predictor was trained on normed hidden states — feeding it the raw residual caused
+token divergence after ~3 steps.
+
+Fix (commit `bd02ce6`): manually apply `RMSNorm(_hidden * final_norm_weight)` before
+using the result as `past_hidden` for the code predictor.
+
+**Bug 3 — `step()` in tts_backend_mk.py missing reset_barriers()**
+`step()` was not calling `reset_barriers()` before `decode()`, causing barrier deadlock
+on the second consecutive call. Only `step_with_embed()` had the reset.
+
+Fix (commit `a54a333`): `step()` now calls `_reset_barriers()` helper; ctypes loader
+also added to `_MKDecoder.__init__` in `tts_backend_mk.py`.
+
+### Performance comparison (all on RTX 5090, "Hello, this is a test.")
+
+| Path | Frames/s | RTF | TTFC |
+|------|----------|-----|------|
+| HF baseline (no graphs) | ~12 | 1.070 | 6338ms |
+| v2 eager (no graphs) | ~17 | ~0.73 | — |
+| v2 + CUDA graphs | ~60 | 0.236 | 142ms |
+| v2 + Megakernel (Stage 6) | **~97** | **0.124** | pending |
+
+### Next steps
+
+1. Pull commit `5a417fe` on GPU and re-run Stage 6 — confirm EOS fires
+2. Run full `V2_MEGAKERNEL=1 python scripts/test_v2_decode.py` — all stages including TTFC
+3. Listen to `/tmp/test_v2_output.wav` — verify audio quality
+4. Update README performance table with confirmed TTFC number
+5. Run end-to-end voice pipeline: `V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn ...`
+
+---
+
 ## 2026-05-15 — Session 9: Phase 3 Code Written (Not Yet GPU-Tested)
 
 ### Current Status

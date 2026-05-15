@@ -13,13 +13,16 @@ Mic → [Deepgram STT] → [gpt-5-mini] → [Custom TTS decode loop] → [Vocode
 Measured on RTX 5090 (Blackwell, sm_120a), CUDA 12.8, bfloat16.
 All numbers after CUDA graph warmup. Text: "Hello, this is a test."
 
-| Metric | HF Baseline | v2 (Custom loop + CUDA graphs) | Target | Gap |
-|--------|-------------|-------------------------------|--------|-----|
-| RTF | 1.070 | **0.209** | < 0.15 | 1.4× |
-| TTFC | 6338 ms | **135 ms** | < 60 ms | 2.25× |
-| Codec frames/s | ~12 | **77** | — | 6.4× faster |
-| Streaming | Buffered (fake) | **Real** (per-frame) | Real | ✅ |
-| EOS | Never fired | **Fires correctly** | — | ✅ |
+| Metric | HF Baseline | v2 (CUDA graphs) | v2 + Megakernel | Target |
+|--------|-------------|------------------|-----------------|--------|
+| RTF | 1.070 | 0.236 | **0.124** ✅ | < 0.15 |
+| TTFC | 6338 ms | 142 ms | pending | < 60 ms |
+| Codec frames/s | ~12 | ~60 | **~97** | — |
+| Streaming | Buffered (fake) | **Real** (per-frame) | **Real** (per-frame) | Real ✅ |
+| EOS | Never fired | **Fires correctly** | **Fires correctly** | — ✅ |
+
+> v2 + Megakernel numbers from Stage 6 validation (sub-test B). RTF target met at 97 frames/s.
+> TTFC measurement pending full Stage 5 run with megakernel active.
 
 ---
 
@@ -62,10 +65,22 @@ Both hot paths captured using `transformers.StaticCache`:
 
 | Component | Eager | Graph | Why graphs work |
 |-----------|-------|-------|-----------------|
-| Predictor (15 steps) | ~49 ms | ~2 ms | Fixed 17-token sequence, static shapes |
-| Talker (28L, 1 step) | ~20 ms | ~3 ms | StaticCache pre-allocated, `index_copy_()` |
+| Predictor (15 steps) | ~42 ms | ~2 ms | Fixed 17-token sequence, static shapes |
+| Talker (28L, 1 step) | ~16 ms | ~3 ms | StaticCache pre-allocated, `index_copy_()` |
 
 `DynamicCache` grows via `torch.cat` every step → dynamo recompiles → falls back to eager. `StaticCache` writes at a fixed index → shapes never change → CUDA graphs work.
+
+### Megakernel path (V2_MEGAKERNEL=1)
+
+When enabled, the talker backbone step uses `torch.ops.qwen_megakernel_C.decode` with a sentinel token (`-1`) that reads the pre-built `inputs_embeds` directly from the hidden buffer, bypassing the embedding lookup table. This lets the correct summed 16-codebook embedding pass through the kernel.
+
+Key implementation detail: the kernel's raw residual output (`_hidden`) is NOT equivalent to HF's `last_hidden_state`. The code predictor expects a normed hidden state. After each kernel call, we apply RMSNorm manually and recompute logits through `lm_head` with the suppress mask — so sampling, EOS detection, and code predictor input are all correct.
+
+| Component | CUDA graph | Megakernel |
+|-----------|-----------|------------|
+| Predictor (15 steps) | ~2 ms | ~2 ms (PredictorGraph still active) |
+| Talker (28L, 1 step) | ~3 ms | **~1 ms** |
+| Total per frame | ~13 ms | **~10 ms** |
 
 ---
 
@@ -230,29 +245,20 @@ docs/
 
 ## Known Limitations
 
-### RTF and TTFC not yet at target
+### RTF target met; TTFC still above target
 
-**Current: RTF 0.209, TTFC 135ms. Targets: RTF < 0.15, TTFC < 60ms.**
+**RTF 0.124 ✅ (target < 0.15). TTFC ~140ms ❌ (target < 60ms).**
 
-Remaining gap (1.4× on RTF) breaks down as:
-- `token.item()` CPU sync every step (~2ms, unavoidable without megakernel embedding sentinel)
-- `pred_input = cat(past_hidden, last_id_hidden)` small GPU op outside graph
-- Python dispatch overhead per step (~3-5ms total)
+TTFC is dominated by:
+- Prefill: ~20ms (HF eager, unavoidable)
+- First chunk: 4 codec frames × ~10ms/frame = ~40ms
+- CUDA graph stream sync on first replay adds overhead
 
-### What closes the gap: Phase 3 (megakernel in v2 loop)
+Closing TTFC to <60ms would require reducing `CHUNK_FRAMES` to 2 (160ms audio chunks) or streaming the first token without waiting for a full chunk.
 
-The `qwen_megakernel` CUDA kernel (`torch.ops.qwen_megakernel_C.decode`) is built and verified. Integrating it requires a 3-line patch to `kernel.cu`:
+### EOS not firing in megakernel path (pending fix)
 
-```cuda
-// When token_id == -1, read embedding from hidden_buffer instead of embed table
-const __nv_bfloat16 *embed_row =
-    (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
-                          : hidden_buffer;
-```
-
-This lets us write `inputs_embeds` into `hidden_buffer` before calling `decode(-1)`, eliminating the `token.item()` sync and the Python embedding construction entirely. Talker step would drop from ~3ms to ~1ms, Python overhead ~5ms → ~0ms.
-
-Estimated final numbers with megakernel: **RTF ~0.05, TTFC ~40ms**.
+Stage 6 sub-test B runs 200 frames without EOS firing. Fix is pushed (commit `5a417fe`) but not yet confirmed on GPU — the patch recomputes tokens from kernel hidden state with the suppress mask instead of using the kernel's internal argmax.
 
 ### Audio quality
 

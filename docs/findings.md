@@ -1,7 +1,7 @@
 # Findings & Observations
 
 > Ground truth only — confirmed by running actual code.
-> Last updated: 2026-05-14 (Session 5)
+> Last updated: 2026-05-15 (Session 10)
 
 ---
 
@@ -107,16 +107,18 @@ audio = wavs[0]
 
 ---
 
-## Baseline Performance (RTX 5090, bfloat16, no flash-attn)
+## Performance (RTX 5090, bfloat16, no flash-attn, "Hello, this is a test.")
 
-| Metric | Value |
-|--------|-------|
-| Model load | ~5800 ms |
-| Generation time | 8582 ± 853 ms |
-| Audio duration | ~9760 ms |
-| **RTF** | **0.879** |
-| Target RTF | < 0.15 |
-| Gap | 5.9× speedup needed |
+| Path | Frames/s | RTF | TTFC | Notes |
+|------|----------|-----|------|-------|
+| HF baseline (eager, no graphs) | ~12 | 1.070 | 6338ms | |
+| v2 + CUDA graphs (TalkerGraph + PredictorGraph) | ~60 | 0.236 | 142ms | confirmed Session 10 |
+| v2 + Megakernel sentinel (V2_MEGAKERNEL=1) | **~97** | **0.124** | pending | RTF target met |
+
+Eager timing breakdown (Stage 3b):
+- Code predictor (15 steps): 42ms/frame
+- Talker backbone (28L, 1 step): 16ms/frame
+- Total eager: ~58ms/frame → 17 frames/s → RTF 0.73
 
 ---
 
