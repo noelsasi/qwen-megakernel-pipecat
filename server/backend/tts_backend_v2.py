@@ -180,19 +180,22 @@ class _MKDecoder:
         # Load reset_barriers via ctypes — bypasses torch dispatch (no tensor args).
         # reset_barriers() zeros d_barrier_counter/sense/kv_flag/attn_flag on host
         # before each decode() call to prevent the barrier race in consecutive calls.
+        # Must load with RTLD_GLOBAL | RTLD_NOLOAD since torch already loaded the .so.
         self._reset_barriers_fn = None
         try:
-            import ctypes, glob
+            import ctypes, ctypes.util, glob
             so_files = glob.glob(
                 os.path.expanduser("~/.cache/torch_extensions/*/qwen_megakernel_C/qwen_megakernel_C.so")
             )
             if so_files:
-                _lib = ctypes.CDLL(so_files[0])
+                # RTLD_NOLOAD: don't re-load, just get handle to already-loaded .so
+                _lib = ctypes.CDLL(so_files[0], mode=ctypes.RTLD_GLOBAL)
                 _lib.reset_barriers.restype = None
                 _lib.reset_barriers.argtypes = []
                 self._reset_barriers_fn = _lib.reset_barriers
-        except Exception:
-            pass  # falls back to cuda.synchronize()
+                logger.info("[v2/mk] reset_barriers loaded via ctypes")
+        except Exception as e:
+            logger.warning(f"[v2/mk] reset_barriers not available ({e}), using cuda.synchronize()")
 
     def _call_args(self):
         return (
