@@ -11,10 +11,11 @@
 | Item | Status |
 |------|--------|
 | v2 CUDA graphs path | ✅ Working — RTF 0.236, TTFC 142ms |
-| Megakernel sentinel path (V2_MEGAKERNEL=1) | ✅ Running — RTF **0.124** (target met), 97 frames/s |
-| EOS fires in megakernel path | ❌ Not yet — fix pushed, pending GPU confirmation |
-| TTFC with megakernel | ❌ Not measured — blocked on EOS fix |
-| Audio quality with megakernel | ❌ Not verified — blocked on EOS fix |
+| Megakernel sentinel path (V2_MEGAKERNEL=1) | ✅ Working — RTF **0.126–0.158**, 95 frames/s |
+| EOS fires in megakernel path | ✅ Confirmed — step 37–62 depending on run |
+| TTFC with megakernel | ✅ Measured — **120ms** (target 60ms) |
+| Audio quality with megakernel | ⏳ WAV saved — needs listening |
+| End-to-end voice pipeline | ⏳ Not yet run |
 
 ### What was confirmed on GPU this session
 
@@ -51,20 +52,20 @@ also added to `_MKDecoder.__init__` in `tts_backend_mk.py`.
 
 ### Performance comparison (all on RTX 5090, "Hello, this is a test.")
 
-| Path | Frames/s | RTF | TTFC |
-|------|----------|-----|------|
-| HF baseline (no graphs) | ~12 | 1.070 | 6338ms |
-| v2 eager (no graphs) | ~17 | ~0.73 | — |
-| v2 + CUDA graphs | ~60 | 0.236 | 142ms |
-| v2 + Megakernel (Stage 6) | **~97** | **0.124** | pending |
+| Path | Frames/s | RTF (raw) | RTF (streaming) | TTFC |
+|------|----------|-----------|-----------------|------|
+| HF baseline (no graphs) | ~12 | 1.070 | 1.070 | 6338ms |
+| v2 eager (no graphs) | ~17 | ~0.73 | — | — |
+| v2 + CUDA graphs | ~60 | 0.236 | 0.236 | 142ms |
+| v2 + Megakernel | **~95** | **0.126** | **0.158** | **120ms** |
 
 ### Next steps
 
-1. Pull commit `5a417fe` on GPU and re-run Stage 6 — confirm EOS fires
-2. Run full `V2_MEGAKERNEL=1 python scripts/test_v2_decode.py` — all stages including TTFC
-3. Listen to `/tmp/test_v2_output.wav` — verify audio quality
-4. Update README performance table with confirmed TTFC number
-5. Run end-to-end voice pipeline: `V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn ...`
+1. Listen to `/tmp/test_v2_output.wav` — verify audio quality with megakernel
+2. Run end-to-end voice pipeline: `V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000`
+3. Connect client and do a live voice round-trip
+4. Optional: set `CHUNK_FRAMES=1` to test TTFC reduction toward 60ms target
+5. Record demo
 
 ---
 

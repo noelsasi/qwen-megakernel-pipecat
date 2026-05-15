@@ -109,11 +109,11 @@ audio = wavs[0]
 
 ## Performance (RTX 5090, bfloat16, no flash-attn, "Hello, this is a test.")
 
-| Path | Frames/s | RTF | TTFC | Notes |
-|------|----------|-----|------|-------|
-| HF baseline (eager, no graphs) | ~12 | 1.070 | 6338ms | |
-| v2 + CUDA graphs (TalkerGraph + PredictorGraph) | ~60 | 0.236 | 142ms | confirmed Session 10 |
-| v2 + Megakernel sentinel (V2_MEGAKERNEL=1) | **~97** | **0.124** | pending | RTF target met |
+| Path | Frames/s | RTF (raw decode) | RTF (streaming) | TTFC | Notes |
+|------|----------|-----------------|-----------------|------|-------|
+| HF baseline (eager, no graphs) | ~12 | 1.070 | 1.070 | 6338ms | |
+| v2 + CUDA graphs (TalkerGraph + PredictorGraph) | ~60 | 0.236 | 0.236 | 142ms | confirmed Session 10 |
+| v2 + Megakernel sentinel (V2_MEGAKERNEL=1) | **~95** | **0.126** | **0.158** | **120ms** | confirmed Session 10 |
 
 Eager timing breakdown (Stage 3b):
 - Code predictor (15 steps): 42ms/frame

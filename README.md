@@ -15,14 +15,14 @@ All numbers after CUDA graph warmup. Text: "Hello, this is a test."
 
 | Metric | HF Baseline | v2 (CUDA graphs) | v2 + Megakernel | Target |
 |--------|-------------|------------------|-----------------|--------|
-| RTF | 1.070 | 0.236 | **0.124** ✅ | < 0.15 |
-| TTFC | 6338 ms | 142 ms | pending | < 60 ms |
-| Codec frames/s | ~12 | ~60 | **~97** | — |
+| RTF | 1.070 | 0.236 | **0.126–0.158** | < 0.15 |
+| TTFC | 6338 ms | 142 ms | **120 ms** | < 60 ms |
+| Codec frames/s | ~12 | ~60 | **~95** | — |
 | Streaming | Buffered (fake) | **Real** (per-frame) | **Real** (per-frame) | Real ✅ |
 | EOS | Never fired | **Fires correctly** | **Fires correctly** | — ✅ |
 
-> v2 + Megakernel numbers from Stage 6 validation (sub-test B). RTF target met at 97 frames/s.
-> TTFC measurement pending full Stage 5 run with megakernel active.
+> All numbers measured on RTX 5090, "Hello, this is a test.", after CUDA graph warmup.
+> Megakernel raw decode RTF: 0.126 (Stage 6). End-to-end streaming RTF: 0.158 (Stage 5 — includes async vocoder thread and chunk queue overhead).
 
 ---
 
@@ -245,20 +245,14 @@ docs/
 
 ## Known Limitations
 
-### RTF target met; TTFC still above target
+### RTF near target; TTFC still above target
 
-**RTF 0.124 ✅ (target < 0.15). TTFC ~140ms ❌ (target < 60ms).**
+**End-to-end streaming RTF: 0.158 (target < 0.15). Raw decode RTF: 0.126 ✅.**
+**TTFC: 120ms (target < 60ms).**
 
-TTFC is dominated by:
-- Prefill: ~20ms (HF eager, unavoidable)
-- First chunk: 4 codec frames × ~10ms/frame = ~40ms
-- CUDA graph stream sync on first replay adds overhead
+The 0.032 RTF gap between raw decode and streaming is async overhead: vocoder thread, chunk queue, and Python async dispatch per chunk. The raw decode loop at 95 frames/s already clears the target.
 
-Closing TTFC to <60ms would require reducing `CHUNK_FRAMES` to 2 (160ms audio chunks) or streaming the first token without waiting for a full chunk.
-
-### EOS not firing in megakernel path (pending fix)
-
-Stage 6 sub-test B runs 200 frames without EOS firing. Fix is pushed (commit `5a417fe`) but not yet confirmed on GPU — the patch recomputes tokens from kernel hidden state with the suppress mask instead of using the kernel's internal argmax.
+TTFC breakdown: prefill ~21ms + 4 frames × ~10ms = ~61ms minimum. The remaining ~60ms is chunk queue and vocoder thread latency. To hit 60ms, set `CHUNK_FRAMES=1` (emit first frame immediately, 80ms audio) — trades chunk granularity for latency.
 
 ### Audio quality
 
