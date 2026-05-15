@@ -28,6 +28,7 @@ This is a new isolated module. Wire it in by setting TTS_BACKEND=v2 in voice_age
 
 import asyncio
 import os
+import struct
 import sys
 import time
 import logging
@@ -58,6 +59,201 @@ MAX_NEW_TOKENS = 4096
 MIN_NEW_TOKENS = 2
 
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+
+# ---------------------------------------------------------------------------
+# Megakernel constants (talker model dimensions)
+# ---------------------------------------------------------------------------
+_MK_NUM_LAYERS = 28
+_MK_HEAD_DIM = 128
+_MK_NUM_Q_HEADS = 16
+_MK_NUM_KV_HEADS = 8
+_MK_HIDDEN_SIZE = 1024
+_MK_VOCAB_SIZE = 3072
+_MK_MAX_SEQ_LEN = 1024   # sufficient for TTS; 32768 tanks tok/s due to huge KV alloc
+_MK_ROPE_THETA = 1_000_000.0
+_MK_LM_NUM_BLOCKS = 1184  # ldg_lm_head_fused block count — must match kernel.cu
+
+
+def _mk_build_rope_tables(max_seq_len, inv_freq=None):
+    if inv_freq is not None:
+        inv_f = inv_freq.float().cpu()
+    else:
+        idx = torch.arange(0, _MK_HEAD_DIM, 2, dtype=torch.float32)
+        inv_f = 1.0 / (_MK_ROPE_THETA ** (idx / _MK_HEAD_DIM))
+    positions = torch.arange(max_seq_len, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_f)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos_table = torch.cos(emb).to(torch.bfloat16).cuda().contiguous()
+    sin_table = torch.sin(emb).to(torch.bfloat16).cuda().contiguous()
+    return cos_table, sin_table
+
+
+_MK_LAYER_KEYS = [
+    "input_layernorm.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "self_attn.o_proj.weight",
+    "post_attention_layernorm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+]
+
+
+def _mk_extract_weights(hf_state):
+    layer_weights = []
+    for i in range(_MK_NUM_LAYERS):
+        prefix = f"talker.model.layers.{i}."
+        for key in _MK_LAYER_KEYS:
+            full_key = prefix + key
+            if full_key not in hf_state:
+                raise KeyError(f"Missing talker weight: {full_key}")
+            layer_weights.append(hf_state[full_key].cuda().contiguous())
+    return dict(
+        embed_weight=hf_state["talker.model.codec_embedding.weight"].cuda().contiguous(),
+        layer_weights=layer_weights,
+        final_norm_weight=hf_state["talker.model.norm.weight"].cuda().contiguous(),
+        lm_head_weight=hf_state["talker.codec_head.weight"].cuda().contiguous(),
+    )
+
+
+def _mk_pack_layer_weights(layer_weights):
+    ptr_size = 8
+    n_ptrs = len(_MK_LAYER_KEYS)
+    buf = bytearray(_MK_NUM_LAYERS * n_ptrs * ptr_size)
+    for i in range(_MK_NUM_LAYERS):
+        for j in range(n_ptrs):
+            ptr = layer_weights[i * n_ptrs + j].data_ptr()
+            struct.pack_into("Q", buf, (i * n_ptrs + j) * ptr_size, ptr)
+    return torch.frombuffer(buf, dtype=torch.uint8).cuda()
+
+
+class _MKDecoder:
+    """
+    Stateful megakernel decoder for one talker backbone step.
+
+    Normal path: step(token_id) — kernel does embed lookup + 28-layer forward + argmax.
+    Sentinel path: step_with_embed(inputs_embeds [1024 bf16]) — caller writes inputs_embeds
+    into _hidden before calling decode(-1). Kernel reads _hidden as the embedding row
+    instead of indexing embed_weight. This is the Phase 3 integration point.
+
+    Requires kernel.cu patch:
+        const __nv_bfloat16 *embed_row =
+            (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
+                                  : hidden_buffer;
+    """
+
+    def __init__(self, weights, inv_freq=None):
+        self._weights = weights
+        self._position = 0
+        self._attn_scale = float(_MK_HEAD_DIM ** -0.5)
+        self._cos_table, self._sin_table = _mk_build_rope_tables(_MK_MAX_SEQ_LEN, inv_freq)
+        self._embed_weight = weights["embed_weight"]
+        self._final_norm_weight = weights["final_norm_weight"]
+        self._lm_head_weight = weights["lm_head_weight"]
+        self._layer_weights_packed = _mk_pack_layer_weights(weights["layer_weights"])
+
+        self._hidden = torch.zeros(_MK_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        self._activations = torch.zeros(_MK_HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        self._residual = torch.zeros(_MK_HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        self._q = torch.zeros(_MK_NUM_Q_HEADS * _MK_HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._k = torch.zeros(_MK_NUM_KV_HEADS * _MK_HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._v = torch.zeros(_MK_NUM_KV_HEADS * _MK_HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._attn_out = torch.zeros(_MK_NUM_Q_HEADS * _MK_HEAD_DIM, dtype=torch.float32, device="cuda")
+        self._mlp_intermediate = torch.zeros(_MK_VOCAB_SIZE, dtype=torch.float32, device="cuda")
+        self._normalized = torch.zeros(_MK_HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        self._k_cache = torch.zeros(
+            _MK_NUM_LAYERS, _MK_NUM_KV_HEADS, _MK_MAX_SEQ_LEN, _MK_HEAD_DIM,
+            dtype=torch.bfloat16, device="cuda",
+        )
+        self._v_cache = torch.zeros(
+            _MK_NUM_LAYERS, _MK_NUM_KV_HEADS, _MK_MAX_SEQ_LEN, _MK_HEAD_DIM,
+            dtype=torch.bfloat16, device="cuda",
+        )
+        self._block_max_vals = torch.full((_MK_LM_NUM_BLOCKS,), float("-inf"), dtype=torch.float32, device="cuda")
+        self._block_max_idxs = torch.zeros(_MK_LM_NUM_BLOCKS, dtype=torch.int32, device="cuda")
+        self._output_token = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self._decode_op = torch.ops.qwen_megakernel_C.decode
+
+    def _call_args(self):
+        return (
+            self._embed_weight,
+            self._layer_weights_packed,
+            self._final_norm_weight,
+            self._lm_head_weight,
+            self._cos_table,
+            self._sin_table,
+            self._k_cache,
+            self._v_cache,
+            self._hidden,
+            self._activations,
+            self._residual,
+            self._q,
+            self._k,
+            self._v,
+            self._attn_out,
+            self._mlp_intermediate,
+            self._normalized,
+            self._block_max_vals,
+            self._block_max_idxs,
+        )
+
+    def step_with_embed(self, inputs_embeds: torch.Tensor) -> int:
+        """
+        Sentinel path: write inputs_embeds [1024] into hidden_buffer, call decode(-1).
+        Kernel reads hidden_buffer as the embedding row (sentinel patch required).
+        Returns next token id (argmax from kernel).
+        """
+        self._hidden.copy_(inputs_embeds.view(_MK_HIDDEN_SIZE))
+        self._decode_op(
+            self._output_token,
+            -1,
+            *self._call_args(),
+            _MK_NUM_LAYERS,
+            self._position,
+            _MK_MAX_SEQ_LEN,
+            self._attn_scale,
+        )
+        self._position += 1
+        return int(self._output_token.item())
+
+    def load_kv_from_hf(self, past_key_values) -> int:
+        """Copy HF DynamicCache into megakernel KV tensors. Returns prefill seq_len."""
+        self._k_cache.zero_()
+        self._v_cache.zero_()
+        for layer_idx, layer in enumerate(past_key_values.layers):
+            k = layer.keys   # [1, kv_heads, seq_len, head_dim]
+            v = layer.values
+            seq = k.shape[2]
+            if seq > _MK_MAX_SEQ_LEN:
+                raise RuntimeError(f"Prefill seq_len {seq} > MK_MAX_SEQ_LEN {_MK_MAX_SEQ_LEN}")
+            self._k_cache[layer_idx, :, :seq, :] = k[0].to(torch.bfloat16)
+            self._v_cache[layer_idx, :, :seq, :] = v[0].to(torch.bfloat16)
+        prefill_len = past_key_values.layers[0].keys.shape[2]
+        self._position = prefill_len
+        self._block_max_vals.fill_(float("-inf"))
+        self._block_max_idxs.zero_()
+        return prefill_len
+
+    def reset(self):
+        self._position = 0
+        self._k_cache.zero_()
+        self._v_cache.zero_()
+        self._block_max_vals.fill_(float("-inf"))
+        self._block_max_idxs.zero_()
+        self._hidden.zero_()
+        self._activations.zero_()
+        self._residual.zero_()
+        self._q.zero_()
+        self._k.zero_()
+        self._v.zero_()
+        self._attn_out.zero_()
+        self._mlp_intermediate.zero_()
+        self._normalized.zero_()
+        self._output_token.zero_()
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +397,7 @@ def _custom_decode_loop(
     on_chunk=None,
     talker_graph=None,      # TalkerGraph instance (CUDA graph path)
     predictor_graph=None,   # PredictorGraph instance (CUDA graph path)
+    mk_decoder=None,        # _MKDecoder instance (megakernel path — highest priority)
 ):
     """
     Custom autoregressive decode loop owning the full generation runtime.
@@ -340,13 +537,36 @@ def _custom_decode_loop(
             inputs_embeds = inputs_embeds + tts_pad_embed
 
         # --- Talker backbone: single decode step ---
-        if talker_graph is not None:
+        if mk_decoder is not None:
+            # Megakernel sentinel path.
+            # inputs_embeds [1, 1, 1024] → write into hidden_buffer → decode(-1)
+            # Kernel reads hidden_buffer as embedding row, runs 28-layer forward,
+            # writes new hidden to hidden_buffer, writes argmax token to output_token.
+            next_tok_id = mk_decoder.step_with_embed(inputs_embeds)
+            past_hidden = mk_decoder._hidden.view(1, 1, _MK_HIDDEN_SIZE).clone()
+            gen_step += 1
+            step = step_idx + 1
+            if step_idx < 5 or step_idx % 20 == 0:
+                logger.debug(f"[v2/mk] step={step_idx} mk_token={next_tok_id} pos={mk_decoder._position-1}")
+            suppress_eos = step < min_new_tokens
+            if next_tok_id == eos_id and not suppress_eos:
+                logger.info(f"[v2/mk] EOS fired at step {step_idx}")
+                if chunk_buffer and on_chunk is not None:
+                    on_chunk(torch.stack(chunk_buffer))
+                    chunk_buffer = []
+                break
+            token = torch.tensor(next_tok_id, dtype=torch.long, device=device)
+        elif talker_graph is not None:
             hidden, logits = talker_graph.run(inputs_embeds, position=prefill_len + step_idx)
             # No clone needed: past_hidden is consumed by predictor_graph.run() at the top
             # of the NEXT iteration, before talker_graph.run() overwrites output_buf again.
             past_hidden = hidden[:, -1:, :]
             if logits is None:
                 logits = codec_head(hidden[:, -1, :])
+            gen_step += 1
+            step = step_idx + 1
+            suppress_eos = step < min_new_tokens
+            token = _sample(logits.squeeze(0), suppress_eos=suppress_eos)
         else:
             backbone_out = talker_model(
                 inputs_embeds=inputs_embeds,
@@ -359,15 +579,10 @@ def _custom_decode_loop(
             past_key_values = backbone_out.past_key_values
             logits = codec_head(hidden[:, -1, :])
             past_hidden = hidden[:, -1:, :].clone()
-        gen_step += 1
-        step = step_idx + 1
-
-        # Sample next CB0 token
-        suppress_eos = step < min_new_tokens
-        token = _sample(logits.squeeze(0), suppress_eos=suppress_eos)
-
-        if step_idx < 5 or step_idx % 20 == 0:
-            logger.debug(f"[v2] step={step_idx} token={token.item()} gen_step={gen_step} eos_suppressed={suppress_eos}")
+            gen_step += 1
+            step = step_idx + 1
+            suppress_eos = step < min_new_tokens
+            token = _sample(logits.squeeze(0), suppress_eos=suppress_eos)
 
         # --- Yield chunk if buffer full ---
         if len(chunk_buffer) >= chunk_size and on_chunk is not None:
@@ -528,9 +743,16 @@ class QwenTTSBackendV2:
         self._config = model.talker.config
         self._speech_tokenizer = model.speech_tokenizer
 
-        # torch.compile for kernel fusion — set V2_COMPILE=0 to disable
-        # CUDA graphs for talker and predictor — much faster than torch.compile
-        # for autoregressive decode. Set V2_CUDA_GRAPHS=0 to disable.
+        # Megakernel decoder — activated by V2_MEGAKERNEL=1.
+        # When active, replaces TalkerGraph for backbone step.
+        # PredictorGraph remains active regardless (code predictor is independent).
+        self._mk_decoder = None
+        self._megakernel_path = megakernel_path
+        if os.environ.get("V2_MEGAKERNEL", "0") == "1":
+            self._setup_megakernel(model)
+
+        # CUDA graphs for talker and predictor.
+        # Skipped for talker if megakernel is active (it handles the backbone instead).
         self._talker_graph = None
         self._predictor_graph = None
         if os.environ.get("V2_CUDA_GRAPHS", "1") != "0":
@@ -538,10 +760,28 @@ class QwenTTSBackendV2:
 
         logger.info(f"[v2] Ready in {(time.perf_counter()-t0)*1000:.0f}ms")
         logger.info(f"[v2] num_code_groups={self._config.num_code_groups}, vocab_size={self._config.vocab_size}")
-        if self._talker_graph:
+        if self._mk_decoder is not None:
+            logger.info("[v2] Megakernel active (sentinel path) + PredictorGraph")
+        elif self._talker_graph:
             logger.info("[v2] TalkerGraph + PredictorGraph CUDA graphs active")
         else:
-            logger.info("[v2] Running uncompiled (set V2_CUDA_GRAPHS=1 to enable CUDA graphs)")
+            logger.info("[v2] Running uncompiled")
+
+    def _setup_megakernel(self, model):
+        try:
+            sys.path.insert(0, self._megakernel_path)
+            from qwen_megakernel.build import get_extension
+            get_extension()
+            logger.info("[v2/mk] Megakernel extension loaded")
+
+            state = model.state_dict()
+            weights = _mk_extract_weights(state)
+            inv_freq = model.talker.model.rotary_emb.inv_freq.detach().cpu()
+            self._mk_decoder = _MKDecoder(weights, inv_freq=inv_freq)
+            logger.info(f"[v2/mk] Decoder ready — MAX_SEQ_LEN={_MK_MAX_SEQ_LEN}, HIDDEN={_MK_HIDDEN_SIZE}")
+        except Exception as e:
+            logger.warning(f"[v2/mk] Megakernel init failed ({e}) — falling back to TalkerGraph/eager")
+            self._mk_decoder = None
 
     def _setup_cuda_graphs(self, model):
         from server.backend.cuda_graphs import TalkerGraph, PredictorGraph
@@ -560,13 +800,15 @@ class QwenTTSBackendV2:
             )
             self._predictor_graph.capture()
 
-            self._talker_graph = TalkerGraph(
-                talker_model=talker.model,
-                talker_config=self._config,
-                codec_head=talker.codec_head,  # include in graph → logits come out directly
-                max_seq_len=512,
-            )
-            self._talker_graph.capture()
+            # Skip TalkerGraph when megakernel handles the backbone
+            if self._mk_decoder is None:
+                self._talker_graph = TalkerGraph(
+                    talker_model=talker.model,
+                    talker_config=self._config,
+                    codec_head=talker.codec_head,
+                    max_seq_len=512,
+                )
+                self._talker_graph.capture()
 
         except Exception as e:
             logger.warning(f"[v2] CUDA graph capture failed ({e}), falling back to eager")
@@ -589,7 +831,10 @@ class QwenTTSBackendV2:
         t_prefill = time.perf_counter() - t0
         logger.info(f"[v2] Prefill done in {t_prefill*1000:.0f}ms, gen_step={gen_step}")
 
-        if self._talker_graph is not None:
+        if self._mk_decoder is not None:
+            self._mk_decoder.reset()
+            self._mk_decoder.load_kv_from_hf(past_kv)
+        elif self._talker_graph is not None:
             self._talker_graph.prefill_kv(past_kv)
 
         frames = _custom_decode_loop(
@@ -601,8 +846,9 @@ class QwenTTSBackendV2:
             tts_pad_embed=tts_pad,
             first_logits=first_logits,
             config=self._config,
-            talker_graph=self._talker_graph,
+            talker_graph=self._talker_graph if self._mk_decoder is None else None,
             predictor_graph=self._predictor_graph,
+            mk_decoder=self._mk_decoder,
         )
 
         t_decode = time.perf_counter() - t0
@@ -682,8 +928,11 @@ class QwenTTSBackendV2:
                     # Push to vocoder thread — decode loop is never blocked
                     _codec_queue.put((chunk.clone(), False))
 
-                # If TalkerGraph is active, copy DynamicCache → StaticCache
-                if self._talker_graph is not None:
+                # Handoff prefill KV cache to whichever backbone is active
+                if self._mk_decoder is not None:
+                    self._mk_decoder.reset()
+                    self._mk_decoder.load_kv_from_hf(past_kv)
+                elif self._talker_graph is not None:
                     self._talker_graph.prefill_kv(past_kv)
 
                 frames = _custom_decode_loop(
@@ -697,8 +946,9 @@ class QwenTTSBackendV2:
                     config=self._config,
                     chunk_size=CHUNK_FRAMES,
                     on_chunk=_on_chunk,
-                    talker_graph=self._talker_graph,
+                    talker_graph=self._talker_graph if self._mk_decoder is None else None,
                     predictor_graph=self._predictor_graph,
+                    mk_decoder=self._mk_decoder,
                 )
                 all_frames_ref.extend(frames)
 

@@ -4,6 +4,89 @@
 
 ---
 
+## 2026-05-15 — Session 8: Alignment Review + Phase 3 Plan
+
+### Alignment Review Findings
+
+Full review of implementation vs assignment requirements:
+
+| Requirement | Status | Notes |
+|---|---|---|
+| Use AlpinDale's megakernel as decode backend | ❌ Not in working path | Kernel is built but `TTS_BACKEND=v2` doesn't use it |
+| Wire to Qwen3-TTS talker decoder | ✅ Correct decode loop | v2 owns the full runtime with correct code predictor |
+| Real streaming to Pipecat | ✅ | Per-frame audio push, async vocoder thread |
+| TTFC < 60ms | ❌ 135ms (2.25×) | Root cause: `token.item()` sync + Python overhead |
+| RTF < 0.15 | ❌ 0.209 (1.4×) | Same root cause |
+| Demo recording | ❌ Not done | Required deliverable |
+| Honest benchmarking | ✅ | Quantified gaps, root causes documented |
+
+**Core gap:** The v2 backend is correct and fast, but it uses `TalkerGraph` (CUDA-captured
+HF PyTorch forward) for the backbone — not the CUDA megakernel. The megakernel is built
+and was used in `tts_backend_mk.py` (Phase 1), but that backend was abandoned because
+it used the wrong decode strategy (no code predictor). The correct fix is to put the
+megakernel *inside* the working v2 decode loop at the talker backbone step.
+
+### Why the gap exists (root cause chain)
+
+1. Phase 1 (`tts_backend_mk.py`): megakernel ran but EOS never fired — the monkey-patch
+   intercepted at the wrong level, missing code predictor + embedding reconstruction.
+2. Phase 2 (`tts_backend_v2.py`): fixed the decode strategy by owning the full loop —
+   but replaced TalkerGraph (HF model) instead of integrating the megakernel.
+3. Phase 3 (now planned): put megakernel *inside* the Phase 2 loop, replacing TalkerGraph.
+
+### Phase 3 Plan Summary
+
+See `docs/custom_decode_architecture.md` sections 5-11 for full specification.
+
+Five concrete steps, each independently verifiable:
+
+**Step 1 — Kernel patch** (server-side, requires rebuild):
+- Find embedding lookup line in `qwen_megakernel/csrc/kernel.cu`
+- Add sentinel: `(input_token_id >= 0) ? embed_weight + ... : hidden_buffer`
+- Change `MAX_SEQ_LEN` from 32768 to 1024 (recovers ~4× tok/s)
+- Rebuild and smoke-test with a zero-weight decode(-1) call
+
+**Step 2 — Copy `_MKDecoder` into v2 backend**:
+- `_MKDecoder` from `tts_backend_mk.py` is self-contained and already tested
+- Add `V2_MEGAKERNEL=1` env gate — default off, existing behavior preserved
+- `_setup_megakernel()` initializes decoder using weights from already-loaded HF model
+
+**Step 3 — Add `mk_decoder` branch to `_custom_decode_loop()`**:
+- Sentinel write: `mk_decoder._hidden.copy_(inputs_embeds.squeeze())`
+- Kernel call with `token_id=-1`
+- Skip `_sample()` (kernel does argmax internally)
+- `past_hidden` from `mk_decoder._hidden.view(1, 1, 1024)`
+
+**Step 4 — Wire prefill handoff**:
+- Call `mk_decoder.load_kv_cache_from_hf(past_kv)` after HF prefill
+- `PredictorGraph` (code predictor) remains active — it's independent of backbone choice
+
+**Step 5 — Staged validation**:
+- Stage A: kernel sentinel smoke test (no Python decode logic yet)
+- Stage B-E: existing `test_v2_decode.py` stages with `V2_MEGAKERNEL=1`
+
+### Expected performance after Phase 3
+
+| Metric | Current (TalkerGraph) | Expected (megakernel) | Target |
+|--------|----------------------|----------------------|--------|
+| Talker step | ~3ms | ~1ms | — |
+| `token.item()` sync | ~2ms (unavoidable) | **0ms** (kernel does argmax) | — |
+| Python overhead | ~5ms | ~2ms | — |
+| Total per frame | ~13ms | ~4ms | <12ms for RTF<0.15 |
+| RTF | 0.209 | **~0.05** | <0.15 |
+| TTFC | 135ms | **~40ms** | <60ms |
+
+### What does NOT change
+
+- Prefill (HF generate_custom_voice intercept)
+- Code predictor + PredictorGraph (CB1..CB15)
+- 16-codebook embedding reconstruction
+- Text conditioning (trailing_text_hiddens)
+- Vocoder (incremental, async thread)
+- Pipecat integration
+
+---
+
 ## 2026-05-14 — Session 1 Complete
 
 ### Summary

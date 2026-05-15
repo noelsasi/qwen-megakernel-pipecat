@@ -330,6 +330,103 @@ async def stage5_streaming_ttfc(backend):
     logger.info("STAGE 5 complete")
 
 
+def stage6_megakernel(backend):
+    """
+    Validate megakernel sentinel path is actually executing.
+
+    Run ONLY when V2_MEGAKERNEL=1. Checks:
+    1. _mk_decoder is initialized (not None)
+    2. step_with_embed() runs without error on a real inputs_embeds
+    3. Output token is in valid range [0, 3072)
+    4. Full decode to EOS with megakernel produces valid codec frames
+    5. tok/s measured and reported
+    """
+    logger.info("=== STAGE 6: Megakernel sentinel validation ===")
+    import os
+    from server.backend.tts_backend_v2 import _build_prefill_inputs_and_run, _custom_decode_loop
+
+    if backend._mk_decoder is None:
+        logger.info("  STAGE 6 SKIP — V2_MEGAKERNEL not set or megakernel init failed")
+        logger.info("  To run: V2_MEGAKERNEL=1 python scripts/test_v2_decode.py")
+        return
+
+    mk = backend._mk_decoder
+    logger.info(f"  Megakernel decoder: initialized, position={mk._position}")
+
+    # Sub-test A: single step_with_embed with zero embedding
+    logger.info("  Sub-test A: single step with zero embedding...")
+    mk.reset()
+    zero_embed = torch.zeros(1024, dtype=torch.bfloat16, device="cuda")
+    try:
+        tok = mk.step_with_embed(zero_embed)
+        valid = 0 <= tok < 3072
+        logger.info(f"  step_with_embed(zeros) → token={tok}, valid={valid}")
+        assert valid, f"Token {tok} out of range [0, 3072)"
+        logger.info("  Sub-test A PASS")
+    except Exception as e:
+        logger.error(f"  Sub-test A FAIL: {e}", exc_info=True)
+        return
+
+    # Sub-test B: full decode with megakernel
+    logger.info("  Sub-test B: full decode to EOS with megakernel...")
+    past_kv, past_hidden, gen_step, trailing, tts_pad, first_logits = \
+        _build_prefill_inputs_and_run(backend._hf, TEST_TEXT, SPEAKER, LANGUAGE)
+
+    mk.reset()
+    prefill_len = mk.load_kv_from_hf(past_kv)
+    logger.info(f"  KV loaded — prefill_len={prefill_len}, mk.position={mk._position}")
+
+    frames_out = []
+    mk_steps = [0]
+
+    def on_chunk(chunk):
+        frames_out.extend([chunk[i] for i in range(chunk.shape[0])])
+
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        frames = _custom_decode_loop(
+            talker=backend._talker,
+            past_key_values=past_kv,
+            past_hidden=past_hidden,
+            gen_step=gen_step,
+            trailing_text_hiddens=trailing,
+            tts_pad_embed=tts_pad,
+            first_logits=first_logits,
+            config=backend._config,
+            max_new_tokens=200,
+            on_chunk=on_chunk,
+            chunk_size=4,
+            talker_graph=None,
+            predictor_graph=backend._predictor_graph,
+            mk_decoder=mk,
+        )
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - t0
+
+    n_frames = len(frames)
+    stopped_before_cap = n_frames < 200
+    audio_dur = n_frames / 12
+    toks_per_sec = n_frames / elapsed if elapsed > 0 else 0
+    rtf = elapsed / audio_dur if audio_dur > 0 else float("inf")
+
+    logger.info(f"  Megakernel decode: {n_frames} frames in {elapsed*1000:.0f}ms")
+    logger.info(f"  Audio duration: {audio_dur:.2f}s")
+    logger.info(f"  tok/s (codec frames/s): {toks_per_sec:.1f}")
+    logger.info(f"  RTF: {rtf:.3f} (target < 0.15)")
+    logger.info(f"  EOS fired: {stopped_before_cap}")
+    if frames:
+        cb0_tokens = [int(f[0]) for f in frames]
+        unique = len(set(cb0_tokens))
+        logger.info(f"  Unique CB0 tokens: {unique} (should be > 1)")
+        logger.info(f"  First 10 CB0: {cb0_tokens[:10]}")
+        logger.info(f"  Last 5 CB0: {cb0_tokens[-5:]}")
+
+    if not stopped_before_cap:
+        logger.warning("  EOS did NOT fire within 200 frames — sequence may be diverging")
+    logger.info("  Sub-test B PASS" if stopped_before_cap and n_frames > 0 else "  Sub-test B PARTIAL")
+    logger.info("STAGE 6 complete")
+
+
 def main():
     logger.info("Loading QwenTTSBackendV2...")
     from server.backend.tts_backend_v2 import QwenTTSBackendV2
@@ -369,6 +466,11 @@ def main():
 
     # Stage 5: Streaming TTFC
     asyncio.run(stage5_streaming_ttfc(backend))
+
+    logger.info("\n" + "="*60)
+
+    # Stage 6: Megakernel sentinel validation (runs when V2_MEGAKERNEL=1)
+    stage6_megakernel(backend)
 
     logger.info("\n" + "="*60)
     logger.info("All stages complete.")

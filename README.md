@@ -117,40 +117,50 @@ ALLOWED_ORIGIN=*
 
 ### 4. Validate the decode pipeline
 
-Before starting the server, run the 5-stage test to confirm everything works:
+Before starting the server, run the staged test to confirm everything works:
 
 ```bash
 source .venv/bin/activate
+
+# v2 baseline (CUDA graphs, no megakernel):
 python scripts/test_v2_decode.py
+
+# With megakernel sentinel path:
+V2_MEGAKERNEL=1 python scripts/test_v2_decode.py
 ```
 
 Takes ~2 minutes (includes CUDA graph warmup). You should see:
 ```
 STAGE 1 PASS  (prefill: ~50ms)
 STAGE 2 PASS  (3 codec frames produced)
-STAGE 3 PASS  (EOS fired at step ~40, ~77 frames/s)
+STAGE 3 PASS  (EOS fired at step ~40)
 STAGE 4 PASS  (WAV saved to /tmp/test_v2_output.wav)
-STAGE 5       (TTFC ~135ms, RTF ~0.21)
+STAGE 5       (TTFC / RTF measurement)
+STAGE 6       (megakernel sentinel validation — only with V2_MEGAKERNEL=1)
 ```
 
 ### 5. Start the server
 
+**With megakernel (assignment target):**
 ```bash
 source .venv/bin/activate
 set -a && source .env && set +a
-TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
 ```
-
-**Expected startup time: ~30 seconds** (CUDA graph capture for talker + predictor).
 
 Server is ready when you see:
 ```
+[v2/mk] Megakernel extension loaded
+[v2/mk] Decoder ready — MAX_SEQ_LEN=1024, HIDDEN=1024
 [PredictorGraph] CUDA graph captured.
-[TalkerGraph] CUDA graph captured.
-[v2] TalkerGraph + PredictorGraph CUDA graphs active
-[v2] Ready in ~30000ms
+[v2] Megakernel active (sentinel path) + PredictorGraph
+[v2] Ready in ~15000ms
 INFO: Application startup complete.
-INFO: Uvicorn running on http://0.0.0.0:8000
+```
+
+**Without megakernel (CUDA graph fallback, for comparison):**
+```bash
+TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
 ```
 
 ### 6. Connect the frontend

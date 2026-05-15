@@ -58,10 +58,61 @@ else
     echo "qwen_megakernel already present — skipping clone"
 fi
 
-# Patch kernel.cu: default LDG_VOCAB_SIZE=151936 (text LLM vocab),
-# talker needs 3072 (codec token vocab). Idempotent — sed no-ops if already patched.
+# Patch 1: LDG_VOCAB_SIZE 151936→3072 (text LLM vocab → codec token vocab). Idempotent.
 sed -i 's/LDG_VOCAB_SIZE = 151936/LDG_VOCAB_SIZE = 3072/' qwen_megakernel/csrc/kernel.cu
 echo "kernel.cu: LDG_VOCAB_SIZE → 3072 (patched)"
+
+# Patch 2: Sentinel support — allow token_id=-1 to read from hidden_buffer.
+# This lets the v2 decode loop pass inputs_embeds directly to the kernel
+# instead of going through an embed table lookup.
+# The patch is idempotent (grep checks before applying).
+KERNEL_FILE="qwen_megakernel/csrc/kernel.cu"
+if grep -q "input_token_id >= 0" "$KERNEL_FILE"; then
+    echo "kernel.cu: sentinel patch already applied"
+else
+    # Find the embed_row assignment and add the sentinel conditional.
+    # The original line looks like:
+    #   const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+    python3 - <<'PYEOF'
+import re, sys
+
+path = "qwen_megakernel/csrc/kernel.cu"
+with open(path) as f:
+    src = f.read()
+
+old = r'const __nv_bfloat16 \*embed_row = embed_weight \+ input_token_id \* HIDDEN_SIZE;'
+new = (
+    "const __nv_bfloat16 *embed_row =\n"
+    "        (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE\n"
+    "                              : hidden_buffer;"
+)
+
+patched = re.sub(old, new, src)
+if patched == src:
+    print("ERROR: Could not find embed_row line to patch. Inspect kernel.cu manually.", file=sys.stderr)
+    # Show context so user can find it
+    for i, line in enumerate(src.splitlines()):
+        if 'embed_row' in line:
+            print(f"  Line {i+1}: {line.strip()}", file=sys.stderr)
+    sys.exit(1)
+
+with open(path, "w") as f:
+    f.write(patched)
+print("kernel.cu: sentinel patch applied (embed_row ternary)")
+PYEOF
+fi
+
+# Patch 3: Reduce MAX_SEQ_LEN from 32768 to 1024.
+# At 32768 the KV cache is 1.88GB per cache (2 caches = 3.76GB) — tanks tok/s.
+# TTS sequences are at most ~300 tokens. 1024 is safe and recovers ~4× tok/s.
+# Idempotent.
+if grep -q "MAX_SEQ_LEN = 32768" "$KERNEL_FILE" || grep -q "MAX_SEQ_LEN=32768" "$KERNEL_FILE"; then
+    sed -i 's/MAX_SEQ_LEN = 32768/MAX_SEQ_LEN = 1024/' "$KERNEL_FILE"
+    sed -i 's/MAX_SEQ_LEN=32768/MAX_SEQ_LEN=1024/' "$KERNEL_FILE"
+    echo "kernel.cu: MAX_SEQ_LEN → 1024 (patched)"
+else
+    echo "kernel.cu: MAX_SEQ_LEN already at target (or different format — check manually)"
+fi
 
 # JIT-build the extension (sm_120a = RTX 5090 Blackwell)
 # pip install -e . is NOT required — get_extension() compiles via torch.utils.cpp_extension
