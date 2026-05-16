@@ -116,11 +116,11 @@ fi
 
 # JIT-build the extension (sm_120a = RTX 5090 Blackwell)
 # pip install -e . is NOT required — get_extension() compiles via torch.utils.cpp_extension
-cd qwen_megakernel && python build.py 2>&1 || true && cd ..
+cd qwen_megakernel/qwen_megakernel && python build.py 2>&1 || true && cd ../..
 
 python -c "
 import sys
-sys.path.insert(0, 'qwen_megakernel')
+sys.path.insert(0, 'qwen_megakernel/qwen_megakernel')
 try:
     from qwen_megakernel.build import get_extension
     get_extension()
