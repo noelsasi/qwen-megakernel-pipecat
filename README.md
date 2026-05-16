@@ -113,106 +113,153 @@ The lm_head matmul over 3072 tokens costs ~0.05ms — negligible on a 5090. No a
 
 ---
 
-## Setup (GPU Server)
+## GPU Server Setup
 
-### 1. Provision a Vast.ai RTX 5090 instance
+This section covers everything from provisioning to a live voice session. The frontend is deployed separately (see [Connect the UI](#connect-the-ui)) — you only need to run the server on the GPU box.
 
-- Template: PyTorch 2.x + CUDA 12.8
-- Disk: 40GB+ (model download ~8GB, PyTorch ~4GB)
-- Open port 8000 in the instance settings
+---
 
-### 2. Clone and run setup
+### Step 1 — Provision a Vast.ai RTX 5090 instance
+
+1. Go to [vast.ai](https://vast.ai) and create an account.
+2. Search for an instance with **RTX 5090** (Blackwell, `sm_120a`).
+3. Select the **PyTorch 2.x + CUDA 12.8** template.
+4. Set disk to **40 GB+** (model ~8 GB, PyTorch ~4 GB, workspace).
+5. Under **Instance Configuration → Open Ports**, add port **8000**.
+6. Start the instance and SSH in:
+   ```bash
+   ssh -p <PORT> root@<VAST_IP>
+   ```
+
+---
+
+### Step 2 — Clone the repo
 
 ```bash
-git clone <your-repo-url> /workspace/qwen-megakernel-pipecat
+git clone https://github.com/noelsasi/qwen-megakernel-pipecat /workspace/qwen-megakernel-pipecat
 cd /workspace/qwen-megakernel-pipecat
+```
+
+---
+
+### Step 3 — Run one-shot setup (~10 min)
+
+```bash
 bash scripts/setup_server.sh
 ```
 
-Setup takes ~10 minutes (PyTorch download is ~820MB). It:
-- Installs system deps (libsndfile1, ffmpeg, git)
-- Creates `.venv` with PyTorch cu128
-- Installs all Python packages
-- Clones and builds the megakernel (for Phase 1 compatibility)
-- Validates v2 backend imports
+This script:
+- Installs system deps (`libsndfile1`, `ffmpeg`, `git`)
+- Creates `.venv` with PyTorch CUDA 12.8
+- Installs all Python packages from `requirements.txt`
+- Clones `qwen_megakernel`, applies the three required kernel patches, and builds the extension
+- Validates that the v2 backend imports cleanly
 
-### 3. Configure environment
+When it finishes you'll see:
+```
+================================================================
+ SETUP COMPLETE
+================================================================
+```
+
+---
+
+### Step 4 — Set API keys
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Fill in:
-```
-OPENAI_API_KEY=sk-...
-DEEPGRAM_API_KEY=dg-...
-ALLOWED_ORIGIN=*
+Fill in exactly these three values:
+```bash
+OPENAI_API_KEY=sk-...        # GPT-4o-mini for LLM responses
+DEEPGRAM_API_KEY=dg-...      # Deepgram for speech-to-text
+ALLOWED_ORIGIN=*             # allow any frontend origin
 ```
 
-### 4. Validate the decode pipeline
+---
 
-Before starting the server, run the staged test to confirm everything works:
+### Step 5 — Validate the decode pipeline (optional but recommended)
+
+Runs a 6-stage end-to-end test without starting the WebSocket server. Takes ~2 minutes (includes CUDA graph warmup and a full synthesis round-trip).
 
 ```bash
 source .venv/bin/activate
-
-# v2 baseline (CUDA graphs, no megakernel):
-python scripts/test_v2_decode.py
-
-# With megakernel sentinel path:
 V2_MEGAKERNEL=1 python scripts/test_v2_decode.py
 ```
 
-Takes ~2 minutes (includes CUDA graph warmup). You should see:
+Expected output:
 ```
-STAGE 1 PASS  (prefill: ~50ms)
-STAGE 2 PASS  (3 codec frames produced)
-STAGE 3 PASS  (EOS fired at step ~40)
-STAGE 4 PASS  (WAV saved to /tmp/test_v2_output.wav)
-STAGE 5       (TTFC / RTF measurement)
-STAGE 6       (megakernel sentinel validation — only with V2_MEGAKERNEL=1)
+STAGE 1 PASS  prefill ~21ms
+STAGE 2 PASS  3 codec frames produced
+STAGE 3 PASS  EOS fired at step ~40
+STAGE 4 PASS  WAV saved → /tmp/test_v2_output.wav
+STAGE 5       TTFC ~120ms  RTF ~0.158
+STAGE 6       megakernel sentinel validated  RTF ~0.126
 ```
 
-### 5. Start the server
+If any stage fails, check `CUDA not available` (driver/CUDA version), or that the megakernel built cleanly in Step 3.
 
-**With megakernel (assignment target):**
+---
+
+### Step 6 — Start the server
+
 ```bash
 source .venv/bin/activate
 set -a && source .env && set +a
-V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app \
+    --host 0.0.0.0 --port 8000
 ```
 
-Server is ready when you see:
+The server is **ready** when you see:
 ```
 [v2/mk] Megakernel extension loaded
 [v2/mk] Decoder ready — MAX_SEQ_LEN=1024, HIDDEN=1024
 [PredictorGraph] CUDA graph captured.
 [v2] Megakernel active (sentinel path) + PredictorGraph
 [v2] Ready in ~15000ms
-INFO: Application startup complete.
+INFO:     Application startup complete.
 ```
 
-**Without megakernel (CUDA graph fallback, for comparison):**
+> Startup takes ~15 seconds (megakernel load + PredictorGraph CUDA graph capture).
+
+**Without megakernel** (CUDA graph fallback — for comparison benchmarking):
 ```bash
 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
 ```
 
-### 6. Connect the frontend
+---
 
-**On your local machine** — open SSH tunnel:
+### Connect the UI
+
+The frontend is deployed at **[https://qwen-megakernel-pipecat.vercel.app](https://qwen-megakernel-pipecat.vercel.app)**.
+
+Because the GPU server runs on a remote IP, you need a tunnel so the browser can reach it over WebSocket:
+
+**Terminal 1 — open the tunnel (keep it running):**
 ```bash
-ssh -p PORT root@VAST_IP -L 8000:localhost:8000 -N
+ssh -p <PORT> root@<VAST_IP> -L 8000:localhost:8000 -N
 ```
 
-**In a new local terminal:**
+**Browser — open the deployed UI:**
+
+1. Go to `https://qwen-megakernel-pipecat.vercel.app`
+2. The server URL field defaults to `ws://localhost:8000/ws` — leave it as-is (the tunnel forwards that to the GPU box)
+3. Click **CONNECT**
+4. Allow microphone access when prompted
+5. Speak — the agent will respond in real-time
+
+> The UI shows live metrics: TTFC, RTF, and codec frames/s in the side panel so you can compare megakernel vs. baseline directly.
+
+**Alternatively, run the frontend locally** (if you prefer not to use the deployed version):
 ```bash
+# On your local machine, in a new terminal
 cd client
 npm install
 VITE_WS_URL=ws://localhost:8000/ws npm run dev
+# Open http://localhost:5173
 ```
-
-Open `http://localhost:5173`, click **CONNECT**, then speak.
 
 ---
 

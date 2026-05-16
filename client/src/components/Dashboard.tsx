@@ -26,7 +26,7 @@ interface Turn {
 }
 
 function now() {
-  return new Date().toISOString().slice(11, 19);
+  return new Date().toLocaleTimeString("en-US", { hour12: false });
 }
 function fmtMs(v: number | null) {
   return v == null ? "—" : `${v.toFixed(0)}`;
@@ -183,9 +183,11 @@ function LogEntry({ entry }: { entry: LogEntry }) {
 export default function Dashboard({
   wsUrl,
   onConnect,
+  onOpenDocs,
 }: {
   wsUrl: string;
   onConnect: (url: string) => void;
+  onOpenDocs: (initialId?: string) => void;
 }) {
   const transportState = usePipecatClientTransportState();
   const { isMicEnabled, enableMic } = usePipecatClientMicControl();
@@ -367,7 +369,7 @@ export default function Dashboard({
           gap: 12,
         }}
       >
-        {/* left: branding */}
+        {/* left: branding + nav */}
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
           <span style={{ fontSize: 14, fontWeight: 600, color: "#09090b", letterSpacing: "-0.02em" }}>
             Qwen3 TTS
@@ -379,28 +381,66 @@ export default function Dashboard({
           }}>
             megakernel
           </span>
+          <span style={{ color: "#e4e4e7", fontSize: 14, marginLeft: 4 }}>|</span>
+          <button
+            onClick={() => onOpenDocs()}
+            style={{
+              background: "none", border: "none", cursor: "pointer",
+              fontSize: 12, fontWeight: 500, color: "#71717a",
+              padding: "2px 6px", borderRadius: 6,
+            }}
+          >
+            Docs
+          </button>
         </div>
 
         {/* right: status + actions */}
-        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12, flexShrink: 0 }}>
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            gap: 12,
+            flexShrink: 0,
+          }}
+        >
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{
-              width: 7, height: 7, borderRadius: "50%", background: statusDot, flexShrink: 0,
-              animation: isBotSpeaking || isUserSpeaking || isConnecting ? "blink 1.4s ease infinite" : "none",
-              transition: "background 0.3s",
-            }} />
-            <span style={{ fontSize: 13, color: "#09090b", fontWeight: 500 }}>{statusLabel}</span>
+            <span
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                background: statusDot,
+                flexShrink: 0,
+                animation:
+                  isBotSpeaking || isUserSpeaking || isConnecting
+                    ? "blink 1.4s ease infinite"
+                    : "none",
+                transition: "background 0.3s",
+              }}
+            />
+            <span style={{ fontSize: 13, color: "#09090b", fontWeight: 500 }}>
+              {statusLabel}
+            </span>
           </div>
           {connected && (
             <button
               onClick={() => enableMic(!isMicEnabled)}
               style={{
-                height: 30, padding: "0 12px", borderRadius: 8,
-                fontSize: 12, fontWeight: 500, cursor: "pointer", transition: "all 0.15s",
+                height: 30,
+                padding: "0 12px",
+                borderRadius: 8,
+                fontSize: 12,
+                fontWeight: 500,
+                cursor: "pointer",
+                transition: "all 0.15s",
                 background: isMicEnabled ? "#f0fdf4" : "#fff0f0",
                 border: `1px solid ${isMicEnabled ? "#86efac" : "#fca5a5"}`,
                 color: isMicEnabled ? "#15803d" : "#dc2626",
-                display: "flex", alignItems: "center", gap: 5,
+                display: "flex",
+                alignItems: "center",
+                gap: 5,
               }}
             >
               {isMicEnabled ? "🎙️ Mic on" : "🔇 Mic off"}
@@ -410,9 +450,15 @@ export default function Dashboard({
             <button
               onClick={handleToggle}
               style={{
-                height: 30, padding: "0 14px", borderRadius: 8,
-                fontSize: 12, fontWeight: 500, cursor: "pointer",
-                background: "#fef2f2", border: "1px solid #fecaca", color: "#dc2626",
+                height: 30,
+                padding: "0 14px",
+                borderRadius: 8,
+                fontSize: 12,
+                fontWeight: 500,
+                cursor: "pointer",
+                background: "#fef2f2",
+                border: "1px solid #fecaca",
+                color: "#dc2626",
               }}
             >
               Disconnect
@@ -501,17 +547,29 @@ export default function Dashboard({
                   gap: 10,
                 }}
               >
-                <label
-                  style={{
-                    fontSize: 11,
-                    fontWeight: 600,
-                    color: "#71717a",
-                    letterSpacing: "0.05em",
-                    textTransform: "uppercase" as const,
-                  }}
-                >
-                  GPU Server URL
-                </label>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <label
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      color: "#71717a",
+                      letterSpacing: "0.05em",
+                      textTransform: "uppercase" as const,
+                    }}
+                  >
+                    GPU Server URL
+                  </label>
+                  <button
+                    onClick={() => onOpenDocs("setup")}
+                    style={{
+                      background: "none", border: "none", cursor: "pointer",
+                      fontSize: 11, fontWeight: 500, color: "#2563eb",
+                      padding: 0, display: "flex", alignItems: "center", gap: 3,
+                    }}
+                  >
+                    Setup Guide →
+                  </button>
+                </div>
                 <div style={{ display: "flex", gap: 8 }}>
                   <input
                     value={urlInput}
@@ -592,10 +650,10 @@ export default function Dashboard({
           </div>
         </div>
 
-        {/* ── RIGHT: always-on metrics + logs panel ── */}
+        {/* ── RIGHT: Metrics + Logs panel ── */}
         <div
           style={{
-            width: 272,
+            width: 420,
             flexShrink: 0,
             borderLeft: "1px solid #e4e4e7",
             background: "#fafafa",
@@ -604,33 +662,27 @@ export default function Dashboard({
             overflow: "hidden",
           }}
         >
+          {/* panel header */}
+          <div
+            style={{
+              height: 36,
+              flexShrink: 0,
+              borderBottom: "1px solid #e4e4e7",
+              background: "#ffffff",
+              display: "flex",
+              alignItems: "center",
+              padding: "0 14px",
+              justifyContent: "space-between",
+            }}
+          >
+            <span style={{ fontSize: 11, fontWeight: 600, color: "#09090b", letterSpacing: "0.01em" }}>
+              Metrics & Logs
+            </span>
+          </div>
+
           {/* metrics section */}
           <div style={{ flexShrink: 0, borderBottom: "1px solid #e4e4e7" }}>
-            <div
-              style={{
-                padding: "12px 14px 10px",
-                borderBottom: "1px solid #f0f0f0",
-              }}
-            >
-              <span
-                style={{
-                  fontSize: 11,
-                  fontWeight: 600,
-                  color: "#09090b",
-                  letterSpacing: "0.01em",
-                }}
-              >
-                Performance
-              </span>
-            </div>
-            <div
-              style={{
-                padding: "10px 14px 12px",
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-              }}
-            >
+            <div style={{ padding: "10px 14px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
               {[
                 {
                   label: "TTFC",
@@ -654,10 +706,7 @@ export default function Dashboard({
                 <div key={label} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                   <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
                     <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-                      <span style={{
-                        fontSize: 11, fontWeight: 700, color: "#71717a",
-                        letterSpacing: "0.06em", fontFamily: "var(--mono)",
-                      }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: "#71717a", letterSpacing: "0.06em", fontFamily: "var(--mono)" }}>
                         {label}
                       </span>
                       <span style={{
@@ -679,51 +728,18 @@ export default function Dashboard({
                       </span>
                     )}
                   </div>
-                  <span style={{ fontSize: 10, color: "#52525b", fontFamily: "var(--mono)" }}>
-                    {target}
-                  </span>
+                  <span style={{ fontSize: 10, color: "#52525b", fontFamily: "var(--mono)" }}>{target}</span>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* logs section — always visible, scrollable */}
-          <div
-            style={{
-              flex: 1,
-              display: "flex",
-              flexDirection: "column",
-              overflow: "hidden",
-            }}
-          >
-            <div
-              style={{
-                padding: "10px 14px 8px",
-                borderBottom: "1px solid #f0f0f0",
-                flexShrink: 0,
-              }}
-            >
-              <span
-                style={{
-                  fontSize: 11,
-                  fontWeight: 600,
-                  color: "#09090b",
-                  letterSpacing: "0.01em",
-                }}
-              >
-                Logs
-              </span>
+          {/* logs section */}
+          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "10px 14px 8px", borderBottom: "1px solid #f0f0f0", flexShrink: 0 }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: "#09090b", letterSpacing: "0.01em" }}>Logs</span>
             </div>
-            <div
-              style={{
-                flex: 1,
-                overflowY: "auto",
-                padding: "8px 14px",
-                display: "flex",
-                flexDirection: "column",
-                gap: 2,
-              }}
-            >
+            <div style={{ flex: 1, overflowY: "auto", padding: "8px 14px", display: "flex", flexDirection: "column", gap: 2 }}>
               {logs.map((l, i) => (
                 <LogEntry key={i} entry={l} />
               ))}
