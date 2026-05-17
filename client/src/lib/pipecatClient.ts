@@ -9,4 +9,4 @@ export function createPipecatClient(wsUrl: string): PipecatClient {
 }
 
 export const DEFAULT_WS_URL =
-  import.meta.env.VITE_WS_URL ?? "ws://localhost:8000/ws";
+  import.meta.env.VITE_WS_URL ?? "ws://localhost:8080/ws";
