@@ -7,7 +7,7 @@
 #   cp .env.example .env && nano .env   # fill OPENAI_API_KEY and DEEPGRAM_API_KEY
 #   source .venv/bin/activate
 #   set -a && source .env && set +a
-#   V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+#   V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8080
 
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -114,6 +114,10 @@ else
     echo "kernel.cu: MAX_SEQ_LEN already at target (or different format — check manually)"
 fi
 
+# Patch 4: Add reset_barriers() to kernel.cu and torch_bindings.cpp.
+# Required for V2_MEGAKERNEL=1 — zeros barrier counters between consecutive decode() calls.
+python3 scripts/patch_kernel_barriers.py
+
 # JIT-build the extension (sm_120a = RTX 5090 Blackwell)
 # pip install -e . is NOT required — get_extension() compiles via torch.utils.cpp_extension
 cd qwen_megakernel/qwen_megakernel && python build.py 2>&1 || true && cd ../..
@@ -158,17 +162,17 @@ echo ""
 echo " 3. Start the server (v2 + megakernel — recommended):"
 echo "    source .venv/bin/activate"
 echo "    set -a && source .env && set +a"
-echo "    V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000"
+echo "    V2_MEGAKERNEL=1 TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8080"
 echo ""
 echo "    Without megakernel (CUDA graph fallback, slower):"
-echo "    TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000"
+echo "    TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8080"
 echo ""
 echo " 4. On your local machine, open SSH tunnel:"
-echo "    ssh -p PORT root@IP -L 8000:localhost:8000 -N"
+echo "    ssh -p PORT root@IP -L 8080:localhost:8080 -N"
 echo ""
 echo " 5. Run frontend:"
 echo "    cd client && npm install"
-echo "    VITE_WS_URL=ws://localhost:8000/ws npm run dev"
+echo "    VITE_WS_URL=ws://localhost:8080/ws npm run dev"
 echo "    # Open http://localhost:5173 → click CONNECT → speak"
 echo ""
 echo " Expected server startup time: ~15s (megakernel load + PredictorGraph CUDA graph capture)"

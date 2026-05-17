@@ -226,18 +226,28 @@ export default function Dashboard({
     }));
   });
 
+  // ID of the bot turn currently being built; -1 means no active bot turn
+  const activeBotTurnIdRef = useRef(-1);
+
   // Build transcript from raw transcript events — correct ordering guaranteed
   useRTVIClientEvent(RTVIEvent.UserTranscript, (data: unknown) => {
     const { text, final } = data as { text: string; final: boolean };
     if (!text?.trim()) return;
     setTurns((prev) => {
       const last = prev[prev.length - 1];
+      // Update in-progress user turn with same or newer text
       if (last && last.role === "user" && !last.final) {
-        // update in-progress user turn
         return [...prev.slice(0, -1), { ...last, text, final }];
       }
-      if (!final && last?.role === "user") return prev; // skip interim if already final
-      return [...prev, { id: ++turnIdRef.current, role: "user", text, final }];
+      // Don't start a new interim turn if the last user turn is already final
+      if (!final && last?.role === "user" && last.final) return prev;
+      // Seal any un-finalized bot turn before starting a new user turn
+      const sealed =
+        last?.role === "bot" && !last.final
+          ? [...prev.slice(0, -1), { ...last, final: true }]
+          : prev;
+      activeBotTurnIdRef.current = -1;
+      return [...sealed, { id: ++turnIdRef.current, role: "user", text, final }];
     });
   });
 
@@ -249,14 +259,19 @@ export default function Dashboard({
     if (!text?.trim()) return;
     setTurns((prev) => {
       const last = prev[prev.length - 1];
-      // Append to in-progress bot turn or start new one
-      if (last && last.role === "bot" && !last.final) {
+      // Append to the same bot turn we opened for this speaking session
+      if (
+        last &&
+        last.role === "bot" &&
+        !last.final &&
+        last.id === activeBotTurnIdRef.current
+      ) {
         return [...prev.slice(0, -1), { ...last, text: last.text + text }];
       }
-      return [
-        ...prev,
-        { id: ++turnIdRef.current, role: "bot", text, final: false },
-      ];
+      // New speaking session — open a fresh bot turn
+      const newId = ++turnIdRef.current;
+      activeBotTurnIdRef.current = newId;
+      return [...prev, { id: newId, role: "bot", text, final: false }];
     });
   });
 
@@ -267,7 +282,8 @@ export default function Dashboard({
   useRTVIClientEvent(RTVIEvent.BotStoppedSpeaking, () => {
     setIsBotSpeaking(false);
     addLog("info", "Bot done");
-    // Mark last bot turn as final
+    // Seal the active bot turn and clear the session ID
+    activeBotTurnIdRef.current = -1;
     setTurns((prev) => {
       const last = prev[prev.length - 1];
       if (last?.role === "bot" && !last.final) {
@@ -370,24 +386,52 @@ export default function Dashboard({
         }}
       >
         {/* left: branding + nav */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-          <span style={{ fontSize: 14, fontWeight: 600, color: "#09090b", letterSpacing: "-0.02em" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <span
+            style={{
+              fontSize: 14,
+              fontWeight: 600,
+              color: "#09090b",
+              letterSpacing: "-0.02em",
+            }}
+          >
             Qwen3 TTS
           </span>
-          <span style={{
-            fontSize: 10, fontWeight: 500, color: "#6366f1",
-            background: "#eef2ff", border: "1px solid #c7d2fe",
-            padding: "2px 7px", borderRadius: 99, letterSpacing: "0.02em",
-          }}>
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 500,
+              color: "#6366f1",
+              background: "#eef2ff",
+              border: "1px solid #c7d2fe",
+              padding: "2px 7px",
+              borderRadius: 99,
+              letterSpacing: "0.02em",
+            }}
+          >
             megakernel
           </span>
-          <span style={{ color: "#e4e4e7", fontSize: 14, marginLeft: 4 }}>|</span>
+          <span style={{ color: "#e4e4e7", fontSize: 14, marginLeft: 4 }}>
+            |
+          </span>
           <button
             onClick={() => onOpenDocs()}
             style={{
-              background: "none", border: "none", cursor: "pointer",
-              fontSize: 12, fontWeight: 500, color: "#71717a",
-              padding: "2px 6px", borderRadius: 6,
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              fontSize: 12,
+              fontWeight: 500,
+              color: "#71717a",
+              padding: "2px 6px",
+              borderRadius: 6,
             }}
           >
             Docs
@@ -547,7 +591,13 @@ export default function Dashboard({
                   gap: 10,
                 }}
               >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                  }}
+                >
                   <label
                     style={{
                       fontSize: 11,
@@ -562,9 +612,16 @@ export default function Dashboard({
                   <button
                     onClick={() => onOpenDocs("setup")}
                     style={{
-                      background: "none", border: "none", cursor: "pointer",
-                      fontSize: 11, fontWeight: 500, color: "#2563eb",
-                      padding: 0, display: "flex", alignItems: "center", gap: 3,
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      fontSize: 11,
+                      fontWeight: 500,
+                      color: "#2563eb",
+                      padding: 0,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 3,
                     }}
                   >
                     Setup Guide →
@@ -575,7 +632,7 @@ export default function Dashboard({
                     value={urlInput}
                     onChange={(e) => setUrlInput(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && handleToggle()}
-                    placeholder="ws://your-gpu-ip:8000/ws"
+                    placeholder="ws://your-gpu-ip:8080/ws"
                     spellCheck={false}
                     style={{
                       flex: 1,
@@ -675,18 +732,35 @@ export default function Dashboard({
               justifyContent: "space-between",
             }}
           >
-            <span style={{ fontSize: 11, fontWeight: 600, color: "#09090b", letterSpacing: "0.01em" }}>
+            <span
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: "#09090b",
+                letterSpacing: "0.01em",
+              }}
+            >
               Metrics & Logs
             </span>
           </div>
 
           {/* metrics section */}
           <div style={{ flexShrink: 0, borderBottom: "1px solid #e4e4e7" }}>
-            <div style={{ padding: "10px 14px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
+            <div
+              style={{
+                padding: "10px 14px 12px",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+            >
               {[
                 {
                   label: "TTFC",
-                  value: metrics.ttfc_ms != null ? `${fmtMs(metrics.ttfc_ms)} ms` : "—",
+                  value:
+                    metrics.ttfc_ms != null
+                      ? `${fmtMs(metrics.ttfc_ms)} ms`
+                      : "—",
                   target: "target < 60 ms",
                   pass: metrics.ttfc_ms != null ? metrics.ttfc_ms < 60 : null,
                 },
@@ -698,48 +772,127 @@ export default function Dashboard({
                 },
                 {
                   label: "E2E",
-                  value: metrics.e2e_ms != null ? `${fmtMs(metrics.e2e_ms)} ms` : "—",
+                  value:
+                    metrics.e2e_ms != null
+                      ? `${fmtMs(metrics.e2e_ms)} ms`
+                      : "—",
                   target: "target < 500 ms",
                   pass: metrics.e2e_ms != null ? metrics.e2e_ms < 500 : null,
                 },
               ].map(({ label, value, target, pass }) => (
-                <div key={label} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
-                    <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-                      <span style={{ fontSize: 11, fontWeight: 700, color: "#71717a", letterSpacing: "0.06em", fontFamily: "var(--mono)" }}>
+                <div
+                  key={label}
+                  style={{ display: "flex", flexDirection: "column", gap: 2 }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "baseline",
+                      justifyContent: "space-between",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "baseline",
+                        gap: 6,
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 700,
+                          color: "#71717a",
+                          letterSpacing: "0.06em",
+                          fontFamily: "var(--mono)",
+                        }}
+                      >
                         {label}
                       </span>
-                      <span style={{
-                        fontSize: 16, fontWeight: 700, fontFamily: "var(--mono)",
-                        color: pass == null ? "#09090b" : pass ? "#16a34a" : "#dc2626",
-                        fontVariantNumeric: "tabular-nums",
-                      }}>
+                      <span
+                        style={{
+                          fontSize: 16,
+                          fontWeight: 700,
+                          fontFamily: "var(--mono)",
+                          color:
+                            pass == null
+                              ? "#09090b"
+                              : pass
+                                ? "#16a34a"
+                                : "#dc2626",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
                         {value}
                       </span>
                     </div>
                     {pass != null && (
-                      <span style={{
-                        fontSize: 10, fontWeight: 600, padding: "1px 6px", borderRadius: 99,
-                        background: pass ? "#f0fdf4" : "#fef2f2",
-                        color: pass ? "#15803d" : "#dc2626",
-                        border: `1px solid ${pass ? "#bbf7d0" : "#fecaca"}`,
-                      }}>
+                      <span
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 600,
+                          padding: "1px 6px",
+                          borderRadius: 99,
+                          background: pass ? "#f0fdf4" : "#fef2f2",
+                          color: pass ? "#15803d" : "#dc2626",
+                          border: `1px solid ${pass ? "#bbf7d0" : "#fecaca"}`,
+                        }}
+                      >
                         {pass ? "✓" : "↑"}
                       </span>
                     )}
                   </div>
-                  <span style={{ fontSize: 10, color: "#52525b", fontFamily: "var(--mono)" }}>{target}</span>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      color: "#52525b",
+                      fontFamily: "var(--mono)",
+                    }}
+                  >
+                    {target}
+                  </span>
                 </div>
               ))}
             </div>
           </div>
 
           {/* logs section */}
-          <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-            <div style={{ padding: "10px 14px 8px", borderBottom: "1px solid #f0f0f0", flexShrink: 0 }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: "#09090b", letterSpacing: "0.01em" }}>Logs</span>
+          <div
+            style={{
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                padding: "10px 14px 8px",
+                borderBottom: "1px solid #f0f0f0",
+                flexShrink: 0,
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: "#09090b",
+                  letterSpacing: "0.01em",
+                }}
+              >
+                Logs
+              </span>
             </div>
-            <div style={{ flex: 1, overflowY: "auto", padding: "8px 14px", display: "flex", flexDirection: "column", gap: 2 }}>
+            <div
+              style={{
+                flex: 1,
+                overflowY: "auto",
+                padding: "8px 14px",
+                display: "flex",
+                flexDirection: "column",
+                gap: 2,
+              }}
+            >
               {logs.map((l, i) => (
                 <LogEntry key={i} entry={l} />
               ))}

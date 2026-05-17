@@ -14,7 +14,7 @@ TTS_BACKEND options (set as env var):
   hf                    — Pure HF baseline, no megakernel
 
 Start:
-  TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+  TTS_BACKEND=v2 uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8080
 """
 
 import asyncio

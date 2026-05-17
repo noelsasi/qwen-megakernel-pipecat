@@ -8,25 +8,27 @@
 ## What We're Building
 
 A real-time voice agent:
+
 ```
 Microphone → STT → LLM → Qwen3-TTS (talker accelerated by CUDA megakernel) → Speaker
 ```
 
 Performance targets from the brief:
+
 - **TTFC** (time to first audio chunk): < 60 ms
-- **RTF** (real-time factor): < 0.15  
+- **RTF** (real-time factor): < 0.15
 - Audio must stream frame-by-frame — no buffering full utterance
 
 ---
 
 ## Status (Final — 2026-05-14)
 
-| Phase | Status |
-|-------|--------|
-| A — Baseline HF inference | ✅ Done — RTF 1.070 mean, TTFC 6338ms mean (3 trials) |
-| B — Streaming | ⚠️ Fake streaming only — full audio buffered then chunked |
-| C — Pipecat pipeline | ✅ Working end-to-end — STT→LLM→TTS→audio confirmed |
-| D — Megakernel decode | ✅ Kernel runs at 263 tok/s — EOS and vocoder integration incomplete |
+| Phase                     | Status                                                               |
+| ------------------------- | -------------------------------------------------------------------- |
+| A — Baseline HF inference | ✅ Done — RTF 1.070 mean, TTFC 6338ms mean (3 trials)                |
+| B — Streaming             | ⚠️ Fake streaming only — full audio buffered then chunked            |
+| C — Pipecat pipeline      | ✅ Working end-to-end — STT→LLM→TTS→audio confirmed                  |
+| D — Megakernel decode     | ✅ Kernel runs at 263 tok/s — EOS and vocoder integration incomplete |
 
 **Final state:** Full voice pipeline works with HF fallback. Megakernel decode loop runs and produces valid tokens at 263 tok/s but does not complete to audio due to EOS divergence and vocoder hidden_states format mismatch.
 
@@ -34,16 +36,16 @@ Performance targets from the brief:
 
 ## Honest Risk Register
 
-| Risk | Severity | Status |
-|------|----------|--------|
-| Qwen3-TTS Python package API is unverified | HIGH | ✅ Resolved — `qwen-tts` pip package, `Qwen3TTSModel` |
-| Internal talker module path is unknown | HIGH | ✅ Resolved — `model.talker`, `model.talker.model` |
-| Streaming/incremental audio decode may not be supported | HIGH | ⚠️ Confirmed unsupported natively — fake streaming implemented |
-| Megakernel constant compatibility is unverified | HIGH | ✅ All constants match after LDG_VOCAB_SIZE patch |
-| RTX 5090 (sm_120) required — no fallback | HIGH | ✅ Running on Vast.ai RTX 5090 |
-| TTFC < 60ms may be unreachable with full model load overhead | MEDIUM | ⏳ Not yet measured with working megakernel |
-| KV cache RoPE format compatibility | HIGH | 🔴 **Active blocker** — HF post-RoPE keys may not match kernel format |
-| Pipecat version and TTSService API may differ from docs | LOW | ✅ Resolved — pipecat 1.1.0 API confirmed |
+| Risk                                                         | Severity | Status                                                                |
+| ------------------------------------------------------------ | -------- | --------------------------------------------------------------------- |
+| Qwen3-TTS Python package API is unverified                   | HIGH     | ✅ Resolved — `qwen-tts` pip package, `Qwen3TTSModel`                 |
+| Internal talker module path is unknown                       | HIGH     | ✅ Resolved — `model.talker`, `model.talker.model`                    |
+| Streaming/incremental audio decode may not be supported      | HIGH     | ⚠️ Confirmed unsupported natively — fake streaming implemented        |
+| Megakernel constant compatibility is unverified              | HIGH     | ✅ All constants match after LDG_VOCAB_SIZE patch                     |
+| RTX 5090 (sm_120) required — no fallback                     | HIGH     | ✅ Running on Vast.ai RTX 5090                                        |
+| TTFC < 60ms may be unreachable with full model load overhead | MEDIUM   | ⏳ Not yet measured with working megakernel                           |
+| KV cache RoPE format compatibility                           | HIGH     | 🔴 **Active blocker** — HF post-RoPE keys may not match kernel format |
+| Pipecat version and TTSService API may differ from docs      | LOW      | ✅ Resolved — pipecat 1.1.0 API confirmed                             |
 
 ---
 
@@ -52,6 +54,7 @@ Performance targets from the brief:
 ### Autoregressive Decoding
 
 LLMs (and the Qwen3-TTS talker) generate one token at a time. Each step:
+
 1. Feed the previous token into the model
 2. Run all transformer layers (matrix multiplications on GPU)
 3. Get a probability distribution over the vocabulary
@@ -82,6 +85,7 @@ The megakernel targets the **Talker LLM** decode loop. The code predictor and vo
 ```
 RTF = time_spent_generating / duration_of_generated_audio
 ```
+
 - RTF = 1.0: generates audio exactly as fast as it plays
 - RTF = 0.15: generates audio 6.7x faster than real-time (target)
 - RTF > 1.0: too slow, playback will stutter
@@ -89,6 +93,7 @@ RTF = time_spent_generating / duration_of_generated_audio
 ### TTFC (Time to First Chunk)
 
 Time from when text is submitted to when the first audio byte is ready to play. Dominated by:
+
 1. Model prefill time (processing the input text prompt)
 2. First autoregressive decode step
 3. Minimum tokens needed before the codec can decode any audio
@@ -140,6 +145,7 @@ print('\n'.join(files))
 ```
 
 **What to look for in the repo files:**
+
 - `modeling_qwen3_tts.py` — the actual model class definition
 - `configuration_qwen3_tts.py` — config class
 - `README.md` — usage examples
@@ -151,7 +157,7 @@ python -c "
 from huggingface_hub import hf_hub_download
 path = hf_hub_download('Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', 'modeling_qwen3_tts.py')
 print(path)
-" 
+"
 # Then: cat <path> | head -100
 # Look for: class names, __init__ signatures, generate() method
 ```
@@ -198,6 +204,7 @@ for name, param in model.named_parameters():
 ```
 
 **Evidence required before proceeding:**
+
 - [ ] Actual class name(s)
 - [ ] Actual module path to talker decoder (e.g. `model.talker.layers` or `model.decoder.blocks`)
 - [ ] Number of layers in talker
@@ -224,38 +231,38 @@ import numpy as np
 
 def run_baseline(text: str, output_path: str = "output.wav"):
     t_load_start = time.perf_counter()
-    
+
     model = ...  # actual load
     processor = ...  # actual processor load
-    
+
     t_load_end = time.perf_counter()
     print(f"Model load time: {(t_load_end - t_load_start)*1000:.0f}ms")
-    
+
     # Warmup (see benchmarking section)
     _ = run_inference(model, processor, "warmup text")
     torch.cuda.synchronize()
-    
+
     # Timed run
     t_start = time.perf_counter()
-    
+
     result = run_inference(model, processor, text)
-    
+
     torch.cuda.synchronize()
     t_end = time.perf_counter()
-    
+
     # Extract audio from result (format TBD from A.3)
     # audio = ???  (numpy array or tensor)
     # sr = ???
-    
+
     audio_duration_s = len(audio) / sr
     total_time_s = t_end - t_start
     rtf = total_time_s / audio_duration_s
-    
+
     print(f"Text: '{text}'")
     print(f"Audio duration: {audio_duration_s*1000:.0f}ms")
     print(f"Generation time: {total_time_s*1000:.0f}ms")
     print(f"RTF: {rtf:.3f}")
-    
+
     sf.write(output_path, audio, sr)
     print(f"Saved: {output_path}")
 
@@ -264,6 +271,7 @@ if __name__ == "__main__":
 ```
 
 **Phase A deliverables:**
+
 - WAV file that plays correctly
 - Measured: model load time, generation time, RTF, audio duration
 - Documented: actual class names, module paths, config values
@@ -304,24 +312,29 @@ Investigation steps:
 **If streaming is NOT supported natively:**
 
 Option A — Fake streaming: generate fully, then chunk the output audio into frames
+
 ```python
 # chunk_size_ms = 100  (100ms chunks)
 # chunk_samples = sample_rate * chunk_size_ms // 1000
 # for i in range(0, len(audio), chunk_samples):
 #     yield audio[i:i+chunk_samples]
 ```
+
 This gives Pipecat streaming semantics but doesn't reduce TTFC.
 
 Option B — Hook into HuggingFace streamer:
+
 ```python
 from transformers import TextIteratorStreamer
 streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=False)
 # Pass to generate() as streamer=streamer
 # Then: for token in streamer: decode_to_audio(token)
 ```
+
 This gives real streaming but only works if the model's generate() accepts a streamer.
 
 Option C — Manual decode loop (required for megakernel integration anyway):
+
 ```python
 # Replace model.generate() with a manual loop:
 # past_kv_cache = None
@@ -348,9 +361,10 @@ Talker tokens per frame: ???  (unknown — depends on model)
 ```
 
 **Target for TTFC < 60ms:**
+
 - Must emit first audio chunk within 60ms of receiving text
 - If prefill takes 30ms and first decode step takes 1ms, minimum TTFC ≈ 31ms + vocoder overhead
-- If vocoder requires N frames before decoding, TTFC = 31ms + N * (1ms/token * tokens_per_frame)
+- If vocoder requires N frames before decoding, TTFC = 31ms + N _ (1ms/token _ tokens_per_frame)
 
 ### B.3 — Async Generator
 
@@ -370,7 +384,7 @@ async def synthesize_streaming(
     Implementation depends on B.1 findings — fill in the actual approach.
     """
     # PLACEHOLDER — replace with actual implementation after B.1
-    
+
     # Option A (fake streaming — always works):
     audio, sr = run_full_inference(model, processor, text)
     chunk_samples = sr // 10  # 100ms chunks
@@ -379,7 +393,7 @@ async def synthesize_streaming(
         chunk = audio_int16[i:i+chunk_samples].tobytes()
         yield chunk, sr
         await asyncio.sleep(0)  # yield control to event loop
-    
+
     # Option B/C (real streaming — implement after B.1 confirms feasibility)
 
 # Test
@@ -387,19 +401,20 @@ async def test_streaming():
     t_first_chunk = None
     t_start = time.perf_counter()
     total_samples = 0
-    
+
     async for chunk, sr in synthesize_streaming(model, processor, "Hello world"):
         if t_first_chunk is None:
             t_first_chunk = time.perf_counter()
             print(f"TTFC: {(t_first_chunk - t_start)*1000:.1f}ms")
         total_samples += len(chunk) // 2  # int16 = 2 bytes per sample
-    
+
     total_time = time.perf_counter() - t_start
     audio_duration = total_samples / sr
     print(f"RTF: {total_time / audio_duration:.3f}")
 ```
 
 **Phase B deliverables:**
+
 - Streaming generator that yields audio chunks
 - Measured TTFC from this approach
 - Documented: whether streaming is real or fake, and why
@@ -423,6 +438,7 @@ python -c "import pipecat.services.tts_service as m; print(m.__file__)"
 ```
 
 **Read the actual TTSService source before writing the subclass.** The public docs may lag the implementation. What to confirm:
+
 - Does `run_tts` return `AsyncGenerator[Frame | None, None]` or something else?
 - What is the exact signature of `TTSAudioRawFrame`?
 - Is `context_id` a real parameter or does it differ by version?
@@ -456,10 +472,10 @@ class QwenTTSService(TTSService):
     async def run_tts(self, text: str, **kwargs) -> AsyncGenerator[Frame | None, None]:
         # context_id parameter — verify from C.1 whether this exists in this version
         context_id = kwargs.get("context_id", "")
-        
+
         try:
             yield TTSStartedFrame()  # or TTSStartedFrame(context_id=context_id) — verify
-            
+
             async for audio_chunk, sr in synthesize_streaming(
                 self.model, self.processor, text
             ):
@@ -469,9 +485,9 @@ class QwenTTSService(TTSService):
                     num_channels=1,
                     # context_id=context_id,  # only if verified from C.1
                 )
-            
+
             yield TTSStoppedFrame()
-            
+
         except Exception as e:
             yield ErrorFrame(error=str(e))
 ```
@@ -522,6 +538,7 @@ if __name__ == "__main__":
 ```
 
 **Phase C deliverables:**
+
 - End-to-end pipeline working (speak → hear response)
 - Measured: end-to-end latency, audio quality, any frame drops
 
@@ -548,6 +565,7 @@ grep -E '#define [A-Z_]+ [0-9]+' csrc/kernel.cu
 ```
 
 **Expected output (verify against actual):**
+
 ```
 #define NUM_LAYERS      28
 #define NUM_KV_HEADS    8
@@ -578,20 +596,20 @@ print(json.dumps(config, indent=2))
 
 **Compatibility matrix (fill from actual inspection):**
 
-| Parameter | Megakernel (kernel.cu) | Qwen3-TTS Talker | Match? | Action Required |
-|-----------|----------------------|------------------|--------|-----------------|
-| NUM_LAYERS | 28 | ??? | ??? | Change to talker depth |
-| HIDDEN_SIZE | 1024 | ??? | ??? | — |
-| INTERMEDIATE_SIZE | 3072 | ??? | ??? | Change if different |
-| NUM_HEADS | 32 | ??? | ??? | Change if different |
-| NUM_KV_HEADS | 8 | ??? | ??? | Change if different |
-| HEAD_DIM | 128 | ??? | ??? | — |
-| VOCAB_SIZE | 151936 | ??? | ??? | Change to codec vocab |
-| MAX_SEQ_LEN | 2048 | ??? | ??? | Increase if needed |
-| Rope theta | ??? | ??? | ??? | Change if different |
-| Attention type | ??? | ??? | ??? | GQA vs MHA |
-| Norm type | RMSNorm | ??? | ??? | — |
-| Activation | SiLU/GeGLU | ??? | ??? | Critical — affects MLP kernel |
+| Parameter         | Megakernel (kernel.cu) | Qwen3-TTS Talker | Match? | Action Required               |
+| ----------------- | ---------------------- | ---------------- | ------ | ----------------------------- |
+| NUM_LAYERS        | 28                     | ???              | ???    | Change to talker depth        |
+| HIDDEN_SIZE       | 1024                   | ???              | ???    | —                             |
+| INTERMEDIATE_SIZE | 3072                   | ???              | ???    | Change if different           |
+| NUM_HEADS         | 32                     | ???              | ???    | Change if different           |
+| NUM_KV_HEADS      | 8                      | ???              | ???    | Change if different           |
+| HEAD_DIM          | 128                    | ???              | ???    | —                             |
+| VOCAB_SIZE        | 151936                 | ???              | ???    | Change to codec vocab         |
+| MAX_SEQ_LEN       | 2048                   | ???              | ???    | Increase if needed            |
+| Rope theta        | ???                    | ???              | ???    | Change if different           |
+| Attention type    | ???                    | ???              | ???    | GQA vs MHA                    |
+| Norm type         | RMSNorm                | ???              | ???    | —                             |
+| Activation        | SiLU/GeGLU             | ???              | ???    | Critical — affects MLP kernel |
 
 **Additional compatibility checks:**
 
@@ -611,6 +629,7 @@ for name, param in model.named_parameters():
 ```
 
 **KV cache layout check:**
+
 ```python
 # Megakernel KV cache shape:
 # [NUM_LAYERS, NUM_KV_HEADS, MAX_SEQ_LEN, HEAD_DIM]
@@ -635,7 +654,7 @@ def extract_talker_weights(hf_model) -> dict:
     """
     talker = hf_model.talker  # VERIFY this path from A.3
     state = talker.state_dict()
-    
+
     # Map HF weight keys → megakernel weight keys
     # This mapping is UNKNOWN until D.1 + D.2 are done
     # Example (speculative, do not use until verified):
@@ -644,7 +663,7 @@ def extract_talker_weights(hf_model) -> dict:
     #     'layers.0.input_layernorm': state['model.layers.0.input_layernorm.weight'],
     #     ...
     # }
-    
+
     return megakernel_weights
 ```
 
@@ -666,7 +685,7 @@ class MegakernelTTSBackend:
         # Extract weights and build megakernel decoder
         weights = extract_talker_weights(hf_model)
         self.mk_decoder = Decoder(weights=weights, tokenizer=processor.tokenizer)
-    
+
     async def synthesize_streaming(self, text: str):
         """
         Uses megakernel for talker decode.
@@ -675,17 +694,17 @@ class MegakernelTTSBackend:
         # Step 1: Prefill — run the full model's prefill pass to get initial KV cache
         # This part still uses HF — the megakernel only accelerates the decode loop
         # UNKNOWN: how to separate prefill from decode in this model
-        
+
         # Step 2: Decode loop with megakernel
         codec_tokens = []
         for step in range(max_steps):
             # Single decode step via megakernel
             token_id = self.mk_decoder.step(last_token_id)
             codec_tokens.append(token_id)
-            
+
             if token_id == EOS_TOKEN:  # verify EOS token ID from D.2
                 break
-            
+
             # Step 3: Every frame_size tokens, run code predictor + vocoder
             # UNKNOWN: frame_size — must verify from B.1
             if len(codec_tokens) % frame_size == 0:
@@ -700,6 +719,7 @@ class MegakernelTTSBackend:
 ```
 
 **Phase D deliverables:**
+
 - Megakernel decode loop running correctly
 - Correctness validated: compare output audio against Phase A baseline
 - tok/s measured and reported
@@ -729,7 +749,7 @@ def measure_toks_per_second(decoder, warmup_steps=10, measure_steps=100):
     for _ in range(warmup_steps):
         decoder.step(some_token_id)
     torch.cuda.synchronize()
-    
+
     # Measure
     times = []
     for trial in range(5):
@@ -739,7 +759,7 @@ def measure_toks_per_second(decoder, warmup_steps=10, measure_steps=100):
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         times.append(measure_steps / (t1 - t0))
-    
+
     mean = np.mean(times)
     std = np.std(times)
     print(f"tok/s: {mean:.1f} ± {std:.1f}")
@@ -751,11 +771,11 @@ def measure_toks_per_second(decoder, warmup_steps=10, measure_steps=100):
 ```python
 def measure_ttfc(backend, text: str, trials: int = 5):
     ttfc_times = []
-    
+
     for _ in range(trials):
         t_start = time.perf_counter()
         first_chunk = True
-        
+
         async for chunk, sr in backend.synthesize_streaming(text):
             if first_chunk:
                 torch.cuda.synchronize()  # ensure GPU work is done
@@ -763,7 +783,7 @@ def measure_ttfc(backend, text: str, trials: int = 5):
                 ttfc_times.append(ttfc)
                 first_chunk = False
             break  # only need the first chunk time
-    
+
     print(f"TTFC: {np.mean(ttfc_times):.1f} ± {np.std(ttfc_times):.1f} ms")
     print(f"Target: < 60ms | {'PASS' if np.mean(ttfc_times) < 60 else 'FAIL'}")
 ```
@@ -773,23 +793,23 @@ def measure_ttfc(backend, text: str, trials: int = 5):
 ```python
 def measure_rtf(backend, text: str, trials: int = 5):
     rtf_values = []
-    
+
     for _ in range(trials):
         t_start = time.perf_counter()
         total_samples = 0
         sample_rate = None
-        
+
         async for chunk, sr in backend.synthesize_streaming(text):
             total_samples += len(chunk) // 2  # int16 = 2 bytes
             sample_rate = sr
-        
+
         torch.cuda.synchronize()
         t_end = time.perf_counter()
-        
+
         audio_duration = total_samples / sample_rate
         gen_time = t_end - t_start
         rtf_values.append(gen_time / audio_duration)
-    
+
     print(f"RTF: {np.mean(rtf_values):.3f} ± {np.std(rtf_values):.3f}")
     print(f"Target: < 0.15 | {'PASS' if np.mean(rtf_values) < 0.15 else 'FAIL'}")
 ```
@@ -852,22 +872,24 @@ apt install -y caddy
 # 2. Caddyfile — replace <your-domain> with Vast.ai IP or a domain pointing to it
 cat > /etc/caddy/Caddyfile <<'EOF'
 <your-domain> {
-    reverse_proxy /ws localhost:8000
-    reverse_proxy localhost:8000
+    reverse_proxy /ws localhost:8080
+    reverse_proxy localhost:8080
 }
 EOF
 systemctl restart caddy
 
 # 3. Start the FastAPI server
 cd /workspace/qwen-megakernel-pipecat
-uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8080
 ```
 
 **FastAPI app must expose:**
+
 - `GET /` — health check
 - `WS /ws` — WebSocket endpoint for Pipecat `WebsocketServerTransport`
 
 **CORS config in voice_agent.py:**
+
 ```python
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
@@ -892,13 +914,13 @@ The React app reads `VITE_WS_URL` at build time and passes it to `WebSocketTrans
 
 ### Required env vars
 
-| Location | Variable | Value |
-|----------|----------|-------|
-| Vast.ai server | `ALLOWED_ORIGIN` | `https://<your-vercel-app>.vercel.app` |
-| Vast.ai server | `HF_TOKEN` | HuggingFace token (gated model access) |
-| Vast.ai server | `OPENAI_API_KEY` | or whichever LLM provider |
-| Vast.ai server | `DEEPGRAM_API_KEY` | if using Deepgram STT |
-| Vercel | `VITE_WS_URL` | `wss://<your-vast-ai-host>/ws` |
+| Location       | Variable           | Value                                  |
+| -------------- | ------------------ | -------------------------------------- |
+| Vast.ai server | `ALLOWED_ORIGIN`   | `https://<your-vercel-app>.vercel.app` |
+| Vast.ai server | `HF_TOKEN`         | HuggingFace token (gated model access) |
+| Vast.ai server | `OPENAI_API_KEY`   | or whichever LLM provider              |
+| Vast.ai server | `DEEPGRAM_API_KEY` | if using Deepgram STT                  |
+| Vercel         | `VITE_WS_URL`      | `wss://<your-vast-ai-host>/ws`         |
 
 ---
 
@@ -919,12 +941,12 @@ The React app reads `VITE_WS_URL` at build time and passes it to `WebSocketTrans
 
 ## Performance Numbers
 
-| Metric | Baseline (HF) | With Megakernel |
-|--------|---------------|-----------------|
-| tok/s  | ???           | ???             |
-| TTFC   | ???ms         | ???ms           |
-| RTF    | ???           | ???             |
-| E2E latency | ???ms   | ???ms           |
+| Metric      | Baseline (HF) | With Megakernel |
+| ----------- | ------------- | --------------- |
+| tok/s       | ???           | ???             |
+| TTFC        | ???ms         | ???ms           |
+| RTF         | ???           | ???             |
+| E2E latency | ???ms         | ???ms           |
 
 ## Benchmarking Methodology
 

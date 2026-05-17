@@ -74,4 +74,4 @@ else:
         f.write(bsrc)
     print("torch_bindings.cpp: reset_barriers_op registered")
 
-print("Done. Now run: cd qwen_megakernel && python build.py && cd ..")
+print("Done. Now run: cd qwen_megakernel/qwen_megakernel && python build.py && cd ../..")

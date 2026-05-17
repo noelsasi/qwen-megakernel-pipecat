@@ -106,13 +106,14 @@
 Pipecat ships official client libraries that handle WebSocket transport, mic access, and audio
 playback natively. No custom audio plumbing needed in the browser.
 
-| Package | NPM name | Purpose |
-|---------|----------|---------|
-| Core client | `@pipecat-ai/client-js` | `PipecatClient` — transport, mic, events |
-| React bindings | `@pipecat-ai/client-react` | Components + hooks |
-| Transport | `@pipecat-ai/websocket-transport` | WebSocket to Pipecat server |
+| Package        | NPM name                          | Purpose                                  |
+| -------------- | --------------------------------- | ---------------------------------------- |
+| Core client    | `@pipecat-ai/client-js`           | `PipecatClient` — transport, mic, events |
+| React bindings | `@pipecat-ai/client-react`        | Components + hooks                       |
+| Transport      | `@pipecat-ai/websocket-transport` | WebSocket to Pipecat server              |
 
 **Client setup (one-time, outside React tree):**
+
 ```ts
 import { PipecatClient } from "@pipecat-ai/client-js";
 import { WebSocketTransport } from "@pipecat-ai/websocket-transport";
@@ -125,23 +126,26 @@ const client = new PipecatClient({
 ```
 
 **React component tree:**
+
 ```tsx
 <PipecatClientProvider client={client}>
-  <PipecatClientAudio />        {/* bot audio playback — automatic */}
-  <MicToggleButton />           {/* uses usePipecatClientMicControl */}
-  <VoiceVisualizer />           {/* real-time mic level bars */}
-  <TranscriptLog />             {/* uses usePipecatConversation */}
-  <MetricsPanel />              {/* TTFC, RTF, tok/s — custom state */}
+  <PipecatClientAudio /> {/* bot audio playback — automatic */}
+  <MicToggleButton /> {/* uses usePipecatClientMicControl */}
+  <VoiceVisualizer /> {/* real-time mic level bars */}
+  <TranscriptLog /> {/* uses usePipecatConversation */}
+  <MetricsPanel /> {/* TTFC, RTF, tok/s — custom state */}
 </PipecatClientProvider>
 ```
 
 **Key hooks used:**
+
 - `usePipecatClientMicControl` → `{ enableMic, isMicEnabled }` — mic toggle
 - `usePipecatConversation` → message stream (user + bot transcripts)
 - `usePipecatClientTransportState` → connection status
 - `useRTVIClientEvent` → subscribe to custom metric events from server
 
 **UI layout (minimal):**
+
 ```
 ┌─────────────────────────────────────────────┐
 │         Qwen3-TTS Voice Agent                │
@@ -158,6 +162,7 @@ const client = new PipecatClient({
 ```
 
 **Why this over Gradio:**
+
 - `PipecatClientAudio` handles audio output streaming natively — this is exactly what we need
 - The client speaks RTVI protocol, which Pipecat server already understands
 - No manual WebSocket audio chunking or MediaRecorder wiring
@@ -180,6 +185,7 @@ TTSAudioRawFrame   — audio PCM bytes from TTS
 ```
 
 **Pipeline topology:**
+
 ```python
 Pipeline([
     transport.input(),          # WebSocket → AudioRawFrame
@@ -194,6 +200,7 @@ Pipeline([
 **Pipecat version pin:** `pipecat-ai==0.0.x` — read from source after install. Do not assume API from docs.
 
 **Transport choice:**
+
 - Primary: `WebsocketServerTransport` (Pipecat built-in, works with Gradio's WebSocket connection)
 - Fallback: `DailyTransport` (Daily.co managed, needs API key but handles all audio I/O)
 
@@ -267,6 +274,7 @@ QwenTTSBackend (Megakernel)
 Source: `github.com/AlpinDale/qwen_megakernel`
 
 **Internal structure:**
+
 ```
 qwen_megakernel/
 ├── csrc/
@@ -283,6 +291,7 @@ qwen_megakernel/
 ```
 
 **What must be verified before Phase D (see compatibility_check.py in implementation_plan.md):**
+
 - `NUM_LAYERS` matches Qwen3-TTS talker depth
 - `HIDDEN_SIZE`, `INTERMEDIATE_SIZE` match
 - `VOCAB_SIZE` — talker outputs codec tokens (NOT text tokens), so this will likely differ from 151936
@@ -521,15 +530,15 @@ Final benchmark + README
 
 ## Key Decisions & Tradeoffs
 
-| Decision | Chosen | Alternative | Why |
-|----------|--------|-------------|-----|
-| UI framework | React + `@pipecat-ai/client-react` | Gradio | Pipecat's own client library handles WebSocket transport, mic, and audio playback via `<PipecatClientAudio>` — no custom plumbing. Speaks RTVI protocol the server already understands. Gradio would require manual WebSocket audio wiring that the Pipecat client does for free. |
-| STT provider | Deepgram (cloud) or Whisper (local) | AssemblyAI | Deepgram has lowest latency; Whisper works offline. Choice after testing. |
-| LLM provider | OpenAI/Anthropic via Pipecat | Local Ollama | Simplest for demo. Ollama is fallback if no API key. |
-| TTS backend interface | `AsyncGenerator[bytes, int]` | `Queue[bytes]` | Generator is simpler, plays well with Pipecat's async pipeline. |
-| Megakernel scope | Talker decode loop only | Full model | Brief specifies this. Code predictor + vocoder stay as HF. |
-| Audio format | PCM int16, 24kHz, mono | float32 | Pipecat's `TTSAudioRawFrame` expects int16 PCM by convention. 24kHz = Qwen3-TTS output. |
-| Phase ordering | A → B → C → D | A → D → C | Working demo first, then optimize. Reduces risk of blocking on megakernel integration. |
+| Decision              | Chosen                              | Alternative    | Why                                                                                                                                                                                                                                                                               |
+| --------------------- | ----------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| UI framework          | React + `@pipecat-ai/client-react`  | Gradio         | Pipecat's own client library handles WebSocket transport, mic, and audio playback via `<PipecatClientAudio>` — no custom plumbing. Speaks RTVI protocol the server already understands. Gradio would require manual WebSocket audio wiring that the Pipecat client does for free. |
+| STT provider          | Deepgram (cloud) or Whisper (local) | AssemblyAI     | Deepgram has lowest latency; Whisper works offline. Choice after testing.                                                                                                                                                                                                         |
+| LLM provider          | OpenAI/Anthropic via Pipecat        | Local Ollama   | Simplest for demo. Ollama is fallback if no API key.                                                                                                                                                                                                                              |
+| TTS backend interface | `AsyncGenerator[bytes, int]`        | `Queue[bytes]` | Generator is simpler, plays well with Pipecat's async pipeline.                                                                                                                                                                                                                   |
+| Megakernel scope      | Talker decode loop only             | Full model     | Brief specifies this. Code predictor + vocoder stay as HF.                                                                                                                                                                                                                        |
+| Audio format          | PCM int16, 24kHz, mono              | float32        | Pipecat's `TTSAudioRawFrame` expects int16 PCM by convention. 24kHz = Qwen3-TTS output.                                                                                                                                                                                           |
+| Phase ordering        | A → B → C → D                       | A → D → C      | Working demo first, then optimize. Reduces risk of blocking on megakernel integration.                                                                                                                                                                                            |
 
 ---
 
@@ -552,10 +561,10 @@ Final benchmark + README
 │  ┌────────────────────────────────────────────────────────────┐  │
 │  │           Reverse Proxy  (Caddy or Nginx)                  │  │
 │  │                                                            │  │
-│  │   :443  → TLS termination → :8000 (FastAPI/uvicorn)        │  │
+│  │   :443  → TLS termination → :8080 (FastAPI/uvicorn)        │  │
 │  │   WSS upgrade handled here                                 │  │
 │  └────────────────────────┬───────────────────────────────────┘  │
-│                           │ ws://localhost:8000
+│                           │ ws://localhost:8080
 │  ┌────────────────────────▼───────────────────────────────────┐  │
 │  │       FastAPI + uvicorn  (server/pipeline/voice_agent.py)  │  │
 │  │                                                            │  │
@@ -575,19 +584,20 @@ Final benchmark + README
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-| Layer | Technology | Host |
-|-------|-----------|------|
-| Frontend | React + `@pipecat-ai/client-react` | Vercel |
-| Transport | Secure WebSocket (WSS) | — |
-| Reverse proxy | Caddy (preferred) or Nginx | Vast.ai instance |
-| API + pipeline | FastAPI + uvicorn + Pipecat | Vast.ai instance |
-| GPU inference | Qwen3-TTS + optional megakernel | Vast.ai RTX 5090 |
+| Layer          | Technology                         | Host             |
+| -------------- | ---------------------------------- | ---------------- |
+| Frontend       | React + `@pipecat-ai/client-react` | Vercel           |
+| Transport      | Secure WebSocket (WSS)             | —                |
+| Reverse proxy  | Caddy (preferred) or Nginx         | Vast.ai instance |
+| API + pipeline | FastAPI + uvicorn + Pipecat        | Vast.ai instance |
+| GPU inference  | Qwen3-TTS + optional megakernel    | Vast.ai RTX 5090 |
 
 **Why Caddy:** auto-HTTPS via Let's Encrypt with zero config. One `Caddyfile` line handles TLS + WSS upgrade. Nginx works but requires manual cert management.
 
 **CORS:** Vercel domain must be in FastAPI's `allow_origins`. Set `ALLOWED_ORIGIN=https://<your-vercel-app>.vercel.app` as an env var.
 
 **Env vars needed on server:**
+
 ```bash
 ALLOWED_ORIGIN=https://<vercel-app>.vercel.app
 HF_TOKEN=<huggingface token for gated model>
@@ -596,6 +606,7 @@ DEEPGRAM_API_KEY=<if using Deepgram STT>
 ```
 
 **Env vars needed on Vercel:**
+
 ```bash
 VITE_WS_URL=wss://<vast-ai-ip-or-domain>/ws
 ```

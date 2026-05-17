@@ -9,7 +9,7 @@ setup:
 # Start the voice agent server (megakernel backend)
 server:
 	source .venv/bin/activate && \
-	uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8000
+	uvicorn server.pipeline.voice_agent:app --host 0.0.0.0 --port 8080
 
 # Run benchmark (requires server already loaded model, or run standalone)
 benchmark:
