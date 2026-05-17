@@ -856,6 +856,66 @@ export default function Dashboard({
             </div>
           </div>
 
+          {/* demo videos section */}
+          <div
+            style={{
+              flexShrink: 0,
+              borderBottom: "1px solid #e4e4e7",
+              padding: "10px 14px 12px",
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+            }}
+          >
+            <span
+              style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: "#09090b",
+                letterSpacing: "0.01em",
+              }}
+            >
+              Demo Videos
+            </span>
+            {[
+              {
+                label: "Walkthrough (arch + numbers)",
+                href: "https://www.loom.com/share/0a86955100c240db8b620b8050ac0aa5",
+              },
+              {
+                label: "UI Demo",
+                href: "https://www.loom.com/share/40fdcaa63c0940d2a5c57cabd24fe6ce",
+              },
+            ].map(({ label, href }) => (
+              <a
+                key={href}
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 12,
+                  color: "#2563eb",
+                  textDecoration: "none",
+                  fontWeight: 500,
+                }}
+                onMouseEnter={(e) =>
+                  ((e.currentTarget as HTMLAnchorElement).style.textDecoration =
+                    "underline")
+                }
+                onMouseLeave={(e) =>
+                  ((e.currentTarget as HTMLAnchorElement).style.textDecoration =
+                    "none")
+                }
+              >
+                <span style={{ fontSize: 13 }}>▶</span>
+                {label}
+              </a>
+            ))}
+          </div>
+
           {/* logs section */}
           <div
             style={{
